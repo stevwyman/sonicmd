@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>StenoPod</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Red+Hat+Display:wght@500;700&family=Red+Hat+Mono:wght@400;500&family=Red+Hat+Text:wght@400;500&display=swap"
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="mast">
+      <div class="mast-inner">
+        <div class="brand">
+          <span class="mark" aria-hidden="true"></span>
+          <div>
+            <h1>StenoPod</h1>
+            <p class="tag">Live transcript · local notes</p>
+          </div>
+        </div>
+        <div class="lamps" aria-label="Status">
+          <span class="lamp" id="lamp-listen"><i></i><span class="lamp-name">Sidecar</span><span class="lamp-state">idle</span></span>
+          <span class="lamp" id="lamp-llm"><i></i><span class="lamp-name">LLM</span><span class="lamp-state">idle</span></span>
+          <span class="lamp" id="lamp-sum"><i></i><span class="lamp-name">Notes</span><span class="lamp-state">idle</span></span>
+        </div>
+        <div class="actions">
+          <button type="button" id="btn-summarize">Update notes</button>
+          <button type="button" class="ghost" id="btn-new">New session</button>
+          <a class="ghost" href="/api/transcript.txt">Transcript</a>
+          <a class="ghost" href="/api/notes.md">Notes.md</a>
+        </div>
+      </div>
+    </header>
+    <div class="desk">
+
+      <p class="meta">
+        <input id="title" maxlength="120" spellcheck="false" aria-label="Session title" />
+        <span id="counts"></span>
+      </p>
+      <p class="device" id="device"></p>
+
+      <main class="split">
+        <section class="pad" aria-labelledby="tx-h">
+          <h2 id="tx-h">Transcript</h2>
+          <ul id="roster" class="roster" aria-label="Speakers"></ul>
+          <ol id="transcript" class="takes"></ol>
+          <p class="empty" id="tx-empty">Waiting for the Metal sidecar. Play audio through the BlackHole multi-output, then run <code>make sidecar</code>.</p>
+        </section>
+        <section class="copy" aria-labelledby="nt-h">
+          <h2 id="nt-h">Markdown notes</h2>
+          <article id="notes" class="prose"></article>
+          <p class="empty" id="nt-empty">Notes appear after enough new speech, or when you press Update notes.</p>
+          <p class="err" id="nt-err" hidden></p>
+        </section>
+      </main>
+    </div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

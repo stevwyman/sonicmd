@@ -1,0 +1,9 @@
+mlx>=0.22.0
+mlx-whisper>=0.4.0
+httpx>=0.27.0
+mlx>=0.22.0
+mlx-whisper>=0.4.0
+httpx>=0.27.0
+numpy>=1.26.0
+onnxruntime>=1.19.0
+pyannote.audio>=3.3.2

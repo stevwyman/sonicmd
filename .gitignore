@@ -216,3 +216,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# StenoPod
+models/*.gguf
+models/*.bin
+models/*.mlmodel
+models/*.onnx
+models/*.partial
+!models/.gitkeep
+data/*
+!data/.gitkeep
+.venv-host/
+.venv-app/
