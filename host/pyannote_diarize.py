@@ -15,7 +15,32 @@ PIPELINE_CANDIDATES = (
 )
 
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def load_repo_env() -> None:
+    """Load KEY=VALUE pairs from the repo .env without overriding the shell."""
+    env_path = REPO_ROOT / ".env"
+    if not env_path.is_file():
+        return
+    for raw in env_path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip("'").strip('"')
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_repo_env()
+
+
 def hf_token() -> str | None:
+    load_repo_env()
     for key in ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
         value = os.environ.get(key, "").strip()
         if value:
@@ -104,7 +129,8 @@ class PyannoteDiarizer:
                 "pyannote.audio needs a Hugging Face token.\n"
                 "1. Accept terms: https://huggingface.co/pyannote/speaker-diarization-community-1\n"
                 "2. Create a read token: https://huggingface.co/settings/tokens\n"
-                "3. export HF_TOKEN=hf_...\n"
+                "3. Put HF_TOKEN=hf_... in a .env file at the repo root (copy .env.example),\n"
+                "   or export HF_TOKEN=hf_... in this shell.\n"
                 "Or run with --diarize ecapa to keep the lighter embedder."
             )
 

@@ -77,7 +77,7 @@ make models
 make up
 
 # 3. Metal Whisper + pyannote sidecar on the Mac
-export HF_TOKEN=hf_...          # see Hugging Face steps below
+cp .env.example .env            # then put your Hugging Face token in .env
 make sidecar-venv
 make sidecar
 ```
@@ -94,7 +94,7 @@ Capture stays on the main thread; pyannote and Whisper run on a worker so ffmpeg
 
 1. Accept the model terms: <https://huggingface.co/pyannote/speaker-diarization-community-1>
 2. Create a read token: <https://huggingface.co/settings/tokens>
-3. `export HF_TOKEN=hf_...` in the shell that runs `make sidecar`
+3. Copy `.env.example` to `.env` and set `HF_TOKEN=hf_...`. That file is gitignored. `make sidecar` and `host/sidecar.py` load it automatically. A shell `export` still wins if you already set one.
 
 Without a token, use the lighter embedder instead: `./.venv-host/bin/python host/sidecar.py --diarize ecapa`
 
@@ -137,7 +137,7 @@ Swap the GGUF in `compose.yaml` if you later try Qwen2.5-7B Q4. That is tighter 
 
 **Overlapping speech.** pyannote.audio segments turns locally (`community-1` on MPS when available). Overlap and heavy compression still confuse labels.
 
-**HF token errors.** Accept the community-1 terms and export `HF_TOKEN`. First sidecar start downloads the pipeline.
+**HF token errors.** Accept the community-1 terms and put `HF_TOKEN` in `.env`. First sidecar start downloads the pipeline.
 
 **Out of memory.** pyannote (PyTorch) and Whisper both sit on the Mac. If the machine swaps, shrink the Podman VM while capturing, or use `--diarize ecapa`.
 
@@ -148,5 +148,6 @@ app/           FastAPI UI + incremental notes
 host/sidecar.py  AVFoundation capture + mlx-whisper + pyannote.audio
 models/        GGUF (gitignored)
 data/          session JSON
+.env           local secrets (`HF_TOKEN`; gitignored)
 compose.yaml   app + ramalama llama.cpp (Vulkan)
 ```
