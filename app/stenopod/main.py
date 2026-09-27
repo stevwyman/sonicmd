@@ -5,30 +5,52 @@ import logging
 import os
 import math
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from stenopod.models import Segment, iso, utc_now
+from stenopod.prompt import notes_language
 from stenopod.store import SessionStore
 from stenopod.summarizer import Summarizer
+from stenopod.voices import VoiceBank
+from stenopod import sidecar_ctl
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("stenopod")
 
+def _load_repo_env() -> None:
+    env_path = Path(__file__).resolve().parent.parent.parent / ".env"
+    if not env_path.is_file():
+        return
+    for raw in env_path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip("'").strip('"')
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_repo_env()
+
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data")).resolve()
-LLM_URL = os.environ.get("LLM_URL", "http://127.0.0.1:8081")
-AUTO_SUMMARY_CHARS = int(os.environ.get("AUTO_SUMMARY_CHARS", "1800"))
-AUTO_SUMMARY_SECONDS = int(os.environ.get("AUTO_SUMMARY_SECONDS", "90"))
+LLM_MODEL = os.environ.get("LLM_MODEL", "mlx-community/Qwen2.5-7B-Instruct-4bit")
+APP_URL = os.environ.get("APP_URL", "http://127.0.0.1:8780")
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 store = SessionStore(DATA_DIR)
-summarizer = Summarizer(LLM_URL)
+voices = VoiceBank(DATA_DIR / "voices.sqlite")
+summarizer = Summarizer(model=LLM_MODEL)
 hub: set[WebSocket] = set()
 lock = asyncio.Lock()
 sidecar_state: dict[str, Any] = {
@@ -36,9 +58,25 @@ sidecar_state: dict[str, Any] = {
     "device": None,
     "source": None,
     "model": None,
+    "phase": None,
+    "recorded_s": None,
+    "wav": None,
     "last_seen": None,
 }
-idle_task: asyncio.Task[None] | None = None
+# True only while a UI recording is in progress.
+ui_recording = False
+# Drop "still listening" heartbeats while Stop is tearing the capture process down.
+suppress_listening = False
+_finish_task: asyncio.Task | None = None
+_rerun_backup: dict[str, dict[str, Any]] = {}
+_duration_cache: dict[str, tuple[int, int, float]] = {}
+CHUNK_S = 55.0
+STAGE_NAMES = {
+    "pyannote": "Speakers",
+    "whisper": "Whisper",
+    "notes": "Notes",
+    "load": "Loading",
+}
 
 
 class IngestSegment(BaseModel):
@@ -70,6 +108,9 @@ class SidecarStatus(BaseModel):
     device: str | None = None
     source: str | None = None
     model: str | None = None
+    phase: str | None = None
+    recorded_s: float | None = None
+    wav: str | None = None
 
 
 class SpeakerNameBody(BaseModel):
@@ -79,6 +120,84 @@ class SpeakerNameBody(BaseModel):
 
 class TitleBody(BaseModel):
     title: str = Field(min_length=1, max_length=120)
+
+
+class VoiceVector(BaseModel):
+    id: str = Field(min_length=1, max_length=2)
+    embedding: list[float]
+
+    @field_validator("embedding")
+    @classmethod
+    def finite_embedding(cls, value: list[float]) -> list[float]:
+        if not 8 <= len(value) <= 4096:
+            raise ValueError("voice embedding has an unexpected length")
+        if any(not math.isfinite(float(item)) for item in value):
+            raise ValueError("voice embedding must be finite")
+        return [float(item) for item in value]
+
+
+class VoiceBody(BaseModel):
+    speakers: list[VoiceVector]
+
+
+class ProgressBody(BaseModel):
+    stage: str = "pyannote"
+    chunk: int = 1
+    chunks: int = 1
+    progress: float = 0.0
+
+
+class SpeakerBounds(BaseModel):
+    """Blank fields mean pyannote chooses the count. Equal min and max means that exact count."""
+
+    min_speakers: int | None = None
+    max_speakers: int | None = None
+
+    @field_validator("min_speakers", "max_speakers")
+    @classmethod
+    def speaker_count(cls, value: int | None) -> int | None:
+        if value is None:
+            return None
+        if not 1 <= value <= 12:
+            raise ValueError("speaker count must be from 1 to 12")
+        return value
+
+    @model_validator(mode="after")
+    def min_not_above_max(self) -> SpeakerBounds:
+        if (
+            self.min_speakers is not None
+            and self.max_speakers is not None
+            and self.min_speakers > self.max_speakers
+        ):
+            raise ValueError("Minimum speakers cannot be higher than the maximum.")
+        return self
+
+
+class RecordingBody(SpeakerBounds):
+    path: str = Field(min_length=1)
+    restart: bool = False
+
+
+class CaptureStartBody(BaseModel):
+    source: str = "both"
+    mic_device: str | None = None
+    diarize: str = "pyannote"
+
+    @field_validator("source")
+    @classmethod
+    def capture_source(cls, value: str) -> str:
+        key = (value or "both").strip().lower()
+        if key not in {"system", "mic", "both"}:
+            raise ValueError("source must be system, mic, or both")
+        return key
+
+    @field_validator("diarize")
+    @classmethod
+    def capture_diarize(cls, value: str) -> str:
+        key = (value or "pyannote").strip().lower()
+        if key not in {"pyannote", "vad", "ecapa"}:
+            raise ValueError("diarize must be pyannote, vad, or ecapa")
+        return key
 
 
 async def broadcast(event: dict[str, Any]) -> None:
@@ -93,20 +212,316 @@ async def broadcast(event: dict[str, Any]) -> None:
         hub.discard(ws)
 
 
+def require_local(request: Request) -> None:
+    host = (request.client.host if request.client else "") or ""
+    if host not in {"127.0.0.1", "::1", "localhost"}:
+        raise HTTPException(403, "Capture start/stop is only allowed from this Mac")
+
+
+def clear_job(session) -> None:
+    session.job_kind = None
+    session.job_stage = None
+    session.job_progress = None
+    session.job_label = None
+    session.job_chunk = 0
+    session.job_chunks = 0
+
+
+def recording_active() -> bool:
+    return sidecar_ctl.running_pid() is not None
+
+
+def captures_dir() -> Path:
+    return (sidecar_ctl.REPO_ROOT / ".run" / "captures").resolve()
+
+
+def cached_wav_duration(path: Path) -> float:
+    st = path.stat()
+    key = str(path.resolve())
+    hit = _duration_cache.get(key)
+    if hit and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
+        return hit[2]
+    dur = sidecar_ctl.wav_duration_s(path)
+    _duration_cache[key] = (st.st_mtime_ns, st.st_size, dur)
+    return dur
+
+
+def recording_label(wav: Path, title: str | None) -> str:
+    cleaned = (title or "").strip()
+    if cleaned and cleaned != "Untitled session":
+        return cleaned
+    parts = wav.stem.split("-")
+    if (
+        len(parts) >= 3
+        and parts[-2].isdigit()
+        and len(parts[-2]) == 8
+        and parts[-1].isdigit()
+        and len(parts[-1]) == 6
+    ):
+        day, clock = parts[-2], parts[-1]
+        return f"{day[0:4]}-{day[4:6]}-{day[6:8]} {clock[0:2]}:{clock[2:4]}"
+    return wav.stem
+
+
+def capture_wav(path: str) -> Path:
+    root = captures_dir()
+    target = Path(path).expanduser().resolve()
+    if not target.is_file() or target.suffix.lower() != ".wav":
+        raise HTTPException(400, "That recording is not on disk.")
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise HTTPException(400, "Recording must live in the captures folder.") from exc
+    return target
+
+
+def list_recordings() -> list[dict[str, Any]]:
+    root = captures_dir()
+    if not root.is_dir():
+        return []
+    index = store.sessions_by_audio()
+    rows: list[dict[str, Any]] = []
+    wavs = sorted(root.glob("*.wav"), key=lambda item: item.stat().st_mtime, reverse=True)
+    for wav in wavs:
+        try:
+            if wav.stat().st_size <= 44:
+                continue
+            dur = cached_wav_duration(wav)
+        except OSError:
+            continue
+        except Exception:
+            log.exception("Could not read %s", wav)
+            continue
+        key = str(wav.resolve())
+        meta = index.get(key) or {}
+        cursor = float(meta.get("cursor") or 0.0)
+        segments = int(meta.get("segments") or 0)
+        too_short = dur < 1.0
+        transcribed = (not too_short) and segments > 0 and cursor >= dur - 1.0
+        recorded_at = datetime.fromtimestamp(wav.stat().st_mtime, timezone.utc).isoformat()
+        rows.append(
+            {
+                "path": key,
+                "name": wav.name,
+                "title": recording_label(wav, meta.get("title")),
+                "session_id": meta.get("id"),
+                "duration_s": dur,
+                "segments": segments,
+                "cursor_s": cursor,
+                "transcribed": transcribed,
+                "too_short": too_short,
+                "current": meta.get("id") == store.current.id,
+                "recorded_at": recorded_at,
+            }
+        )
+    return rows
+
+
+def current_has_recording() -> bool:
+    if store.current.segments:
+        return True
+    path = store.current.audio_path
+    if not path:
+        return False
+    wav = Path(path)
+    if not wav.is_file():
+        return False
+    dur = float(store.current.audio_duration_s or 0.0)
+    if dur <= 0:
+        try:
+            dur = cached_wav_duration(wav)
+        except Exception:
+            return False
+    return dur >= 1.0
+
+
+def activate_recording(wav: Path, duration_s: float, restart: bool) -> None:
+    found = store.find_id_for_audio(wav)
+    if found and found != store.current.id:
+        store.load(found)
+    elif not found and current_has_recording():
+        store.bind_wav(wav, duration_s, recording_label(wav, None))
+    elif not found:
+        store.current.audio_path = str(wav.resolve())
+        store.current.audio_cursor_s = 0.0
+        if store.current.title in {"", "Untitled session"}:
+            store.current.title = recording_label(wav, None)
+    store.current.audio_path = str(wav.resolve())
+    store.current.audio_duration_s = duration_s
+    if restart:
+        session = store.current
+        _rerun_backup[session.id] = {
+            "segments": list(session.segments),
+            "notes": session.notes,
+            "notes_updated_at": session.notes_updated_at,
+            "last_summarized_index": session.last_summarized_index,
+            "speaker_names": dict(session.speaker_names),
+            "speaker_embeddings": {key: list(value) for key, value in session.speaker_embeddings.items()},
+            "audio_cursor_s": float(session.audio_cursor_s or 0.0),
+        }
+        session.segments.clear()
+        session.audio_cursor_s = 0.0
+        session.notes = ""
+        session.notes_updated_at = None
+        session.last_summarized_index = 0
+        session.speaker_names = {}
+        session.speaker_embeddings = {}
+        session.summary_error = None
+        session.transcribe_error = None
+        clear_job(session)
+    store.save()
+
+
+def transcribe_running() -> bool:
+    return _finish_task is not None and not _finish_task.done()
+
+
+def job_busy() -> bool:
+    return bool(
+        ui_recording
+        or recording_active()
+        or store.current.transcribing
+        or store.current.summarizing
+        or transcribe_running()
+    )
+
+
+def remember_wav_duration() -> None:
+    session = store.current
+    path = session.audio_path
+    if session.audio_duration_s > 0 or not path or recording_active():
+        return
+    wav = Path(path)
+    if not wav.is_file():
+        return
+    try:
+        session.audio_duration_s = sidecar_ctl.wav_duration_s(wav)
+        store.save()
+    except Exception:
+        log.exception("Could not read wav duration")
+
+
 def public_state() -> dict[str, Any]:
+    remember_wav_duration()
     listening = False
     last = sidecar_state.get("last_seen")
-    if sidecar_state.get("listening") and isinstance(last, datetime):
+    if sidecar_state.get("listening") and isinstance(last, datetime) and recording_active():
         listening = (utc_now() - last).total_seconds() < 8
+    recorded = sidecar_state.get("recorded_s")
+    cursor = float(store.current.audio_cursor_s or 0.0)
+    duration = float(store.current.audio_duration_s or 0.0)
+    if listening and isinstance(recorded, (int, float)):
+        duration = float(recorded)
+    pending_audio_s = max(0.0, duration - cursor) if duration else None
+    snap = store.current.snapshot()
+    snap["pending_audio_s"] = pending_audio_s
+    snap["audio_duration_s"] = duration or snap.get("audio_duration_s") or 0.0
+    try:
+        recordings = list_recordings()
+    except Exception:
+        log.exception("Could not list recordings")
+        recordings = []
     return {
-        **store.current.snapshot(),
+        **snap,
+        "recordings": recordings,
         "sidecar": {
             "listening": listening,
             "device": sidecar_state.get("device"),
             "source": sidecar_state.get("source"),
             "model": sidecar_state.get("model"),
+            "phase": sidecar_state.get("phase"),
+            "recorded_s": recorded if listening else snap["audio_duration_s"],
+            "wav": sidecar_state.get("wav") or store.current.audio_path,
         },
+        "capture": sidecar_ctl.status(),
     }
+
+
+async def transcribe_pending(
+    min_speakers: int | None = None,
+    max_speakers: int | None = None,
+) -> dict[str, Any]:
+    """Run pyannote on the whole wav, then Whisper on each turn."""
+    async with lock:
+        session = store.current
+        if session.transcribing:
+            raise RuntimeError("already transcribing")
+        if recording_active():
+            raise RuntimeError("stop recording first")
+        session_id = session.id
+        cursor = float(session.audio_cursor_s or 0.0)
+        audio_path = session.audio_path
+        if not audio_path or not Path(audio_path).is_file():
+            raise RuntimeError("no recording on disk")
+        session.transcribing = True
+        session.transcribe_error = None
+        session.min_speakers = min_speakers
+        session.max_speakers = max_speakers
+        session.speaker_bounds_saved = True
+        session.job_kind = "transcribe"
+        session.job_stage = "load"
+        session.job_progress = None
+        session.job_label = "Loading speakers and Whisper"
+        session.job_chunk = 0
+        session.job_chunks = 0
+        store.save()
+
+    await broadcast({"type": "state", "state": public_state()})
+    try:
+        recorded_s = await asyncio.to_thread(sidecar_ctl.wav_duration_s, audio_path)
+        async with lock:
+            if store.current.id == session_id:
+                store.current.audio_duration_s = recorded_s
+                store.save()
+        if recorded_s - cursor < 1.0:
+            async with lock:
+                if store.current.id == session_id:
+                    clear_job(store.current)
+                    store.current.audio_duration_s = recorded_s
+                    if recorded_s < 1.0:
+                        store.current.transcribe_error = "Recording is too short to transcribe."
+                    elif not store.current.segments:
+                        store.current.transcribe_error = "No speech found in this recording."
+                    store.save()
+            return {"ok": True, "skipped": True, "start_s": cursor, "end_s": recorded_s, "wav": audio_path}
+        log.info("Transcribing wav %s from %.1fs to %.1fs", audio_path, cursor, recorded_s)
+        result = await asyncio.to_thread(
+            sidecar_ctl.process_file,
+            audio_path,
+            cursor,
+            recorded_s,
+            APP_URL,
+            CHUNK_S,
+            min_speakers,
+            max_speakers,
+        )
+        if not result.get("ok"):
+            raise RuntimeError(str(result.get("error") or "transcription failed"))
+        used_end = float(result.get("end_s") or recorded_s)
+        async with lock:
+            if store.current.id != session_id:
+                return result
+            if used_end > cursor:
+                store.current.audio_cursor_s = used_end
+            store.current.audio_path = str(result.get("wav") or audio_path)
+            store.current.audio_duration_s = recorded_s
+            store.save()
+        return result
+    except Exception as exc:
+        err = str(exc)
+        log.exception("Transcription failed")
+        async with lock:
+            if store.current.id == session_id:
+                store.current.transcribe_error = err
+                clear_job(store.current)
+                store.save()
+        raise
+    finally:
+        async with lock:
+            if store.current.id == session_id:
+                store.current.transcribing = False
+                store.save()
+        await broadcast({"type": "state", "state": public_state()})
 
 
 async def maybe_summarize(reason: str, force: bool = False) -> None:
@@ -114,66 +529,203 @@ async def maybe_summarize(reason: str, force: bool = False) -> None:
         session = store.current
         if session.summarizing:
             return
+        if session.transcribing:
+            return
+        if recording_active():
+            return
         pending = session.pending_text()
         if not pending:
             return
         if not force and len(pending) < 200:
             return
-        if not force and len(pending) < AUTO_SUMMARY_CHARS:
-            return
         session.summarizing = True
         session.summary_error = None
+        session.job_kind = "notes"
+        session.job_stage = "notes"
+        session.job_progress = None
+        session.job_label = "Writing notes"
+        session.job_chunk = 0
+        session.job_chunks = 0
         notes = session.notes
         session_id = session.id
         summarized_index = len(session.segments)
+        language = notes_language(session.segments)
 
     await broadcast({"type": "state", "state": public_state()})
     log.info("Summarizing (%s) pending_chars=%s", reason, len(pending))
     try:
-        notes_out = await summarizer.summarize(notes, pending)
+        notes_out = await summarizer.summarize(notes, pending, language)
         async with lock:
             if store.current.id != session_id:
                 return
             store.current.summarizing = False
+            clear_job(store.current)
             store.persist_notes(notes_out, summarized_index)
     except Exception as exc:
         log.exception("Summary failed")
         err = str(exc)
-        if "All connection attempts failed" in err or "ConnectError" in type(exc).__name__:
-            err = f"Cannot reach the notes model at {LLM_URL}. Start it with `make up`."
+        if "not in the local Hugging Face cache" in err or "Host venv missing" in err:
+            err = (
+                f"Notes model {LLM_MODEL} is not ready. "
+                "Run `make models` once while online, then transcribe again."
+            )
         async with lock:
-            store.current.summarizing = False
-            store.current.summary_error = err
+            if store.current.id == session_id:
+                store.current.summarizing = False
+                store.current.summary_error = err
+                clear_job(store.current)
+                store.save()
+    await broadcast({"type": "state", "state": public_state()})
+
+
+async def _store_transcribe_error(message: str) -> None:
+    if message == "already transcribing":
+        return
+    async with lock:
+        if not store.current.transcribe_error:
+            store.current.transcribe_error = message
+        clear_job(store.current)
+        store.save()
+    await broadcast({"type": "state", "state": public_state()})
+
+
+async def _clear_transcribe_job() -> None:
+    async with lock:
+        if store.current.job_kind == "transcribe" and not store.current.transcribing:
+            clear_job(store.current)
             store.save()
     await broadcast({"type": "state", "state": public_state()})
 
 
-async def idle_watchdog() -> None:
-    while True:
-        await asyncio.sleep(5)
-        async with lock:
-            session = store.current
-            if session.summarizing or not session.segments:
-                continue
-            pending = session.pending_text()
-            if len(pending) < 200:
-                continue
-            last_seg = session.segments[-1]
-            try:
-                last_dt = datetime.fromisoformat(last_seg.t.replace("Z", "+00:00"))
-            except ValueError:
-                continue
-            quiet = (utc_now() - last_dt).total_seconds()
-        if quiet >= AUTO_SUMMARY_SECONDS:
-            await maybe_summarize("idle")
+async def _restore_rerun_if_empty() -> None:
+    """Put the previous transcript back when a rerun exits before any new turns."""
+    async with lock:
+        session = store.current
+        backup = _rerun_backup.get(session.id)
+        if backup is None:
+            return
+        if session.segments:
+            _rerun_backup.pop(session.id, None)
+            return
+        session.segments = backup["segments"]
+        session.notes = backup["notes"]
+        session.notes_updated_at = backup["notes_updated_at"]
+        session.last_summarized_index = backup["last_summarized_index"]
+        session.speaker_names = backup["speaker_names"]
+        session.speaker_embeddings = backup.get("speaker_embeddings") or {}
+        session.audio_cursor_s = backup["audio_cursor_s"]
+        store.save()
+        _rerun_backup.pop(session.id, None)
+    await broadcast({"type": "state", "state": public_state()})
+
+
+async def finish_recording(
+    min_speakers: int | None = None,
+    max_speakers: int | None = None,
+) -> None:
+    try:
+        result = await transcribe_pending(min_speakers, max_speakers)
+    except RuntimeError as exc:
+        await _store_transcribe_error(str(exc))
+        await _restore_rerun_if_empty()
+        return
+    except Exception:
+        log.exception("Transcription failed")
+        await _clear_transcribe_job()
+        await _restore_rerun_if_empty()
+        return
+    if result.get("skipped"):
+        await _clear_transcribe_job()
+        await _restore_rerun_if_empty()
+        return
+    await maybe_summarize("after-transcribe", force=True)
+    async with lock:
+        if not store.current.segments and not store.current.transcribe_error:
+            store.current.transcribe_error = "No speech found in this recording."
+            store.save()
+    await _restore_rerun_if_empty()
+    await _clear_transcribe_job()
+
+
+async def begin_transcription(
+    min_speakers: int | None = None,
+    max_speakers: int | None = None,
+) -> dict[str, Any]:
+    global _finish_task
+    if ui_recording or recording_active():
+        raise HTTPException(409, "Stop recording before transcribing.")
+    if store.current.summarizing:
+        raise HTTPException(409, "Notes are still being written.")
+    if store.current.transcribing or transcribe_running():
+        return public_state()
+    path = store.current.audio_path
+    if not path or not Path(path).is_file():
+        raise HTTPException(400, "No recording on disk for this meeting.")
+    async with lock:
+        session = store.current
+        dur = float(session.audio_duration_s or 0.0)
+        cursor = float(session.audio_cursor_s or 0.0)
+        if dur >= 1.0 and not session.segments and cursor >= dur - 1.0:
+            session.audio_cursor_s = 0.0
+            session.transcribe_error = None
+            store.save()
+    log.info(
+        "Starting transcription for %s (speakers min=%s max=%s)",
+        path,
+        min_speakers,
+        max_speakers,
+    )
+    _finish_task = asyncio.create_task(finish_recording(min_speakers, max_speakers))
+    for _ in range(50):
+        if store.current.transcribing or store.current.transcribe_error or _finish_task.done():
+            break
+        await asyncio.sleep(0.05)
+    return public_state()
+
+
+async def resume_unfinished_recording() -> None:
+    """A stop that died after the wav closed never saved the duration or started transcription."""
+    await asyncio.sleep(0.3)
+    if ui_recording or recording_active() or transcribe_running():
+        return
+    session = store.current
+    path = session.audio_path
+    if not path or not Path(path).is_file():
+        return
+    try:
+        dur = await asyncio.to_thread(sidecar_ctl.wav_duration_s, path)
+    except Exception:
+        log.exception("Could not read wav duration on startup")
+        return
+    cursor = float(session.audio_cursor_s or 0.0)
+    if dur < 1.0 or dur - cursor < 1.0:
+        return
+    if session.segments and cursor >= dur - 1.0:
+        return
+    async with lock:
+        current = store.current
+        if current.id != session.id:
+            return
+        cur = float(current.audio_cursor_s or 0.0)
+        if current.segments and cur >= dur - 1.0:
+            return
+        current.audio_duration_s = dur
+        current.transcribe_error = None
+        store.save()
+    log.info("Recording %s was closed but not transcribed (%.0fs). Starting now.", path, dur)
+    try:
+        await begin_transcription()
+    except HTTPException as exc:
+        log.warning("Could not resume transcription: %s", exc.detail)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global idle_task
-    idle_task = asyncio.create_task(idle_watchdog())
+    await asyncio.to_thread(sidecar_ctl.running_pid)
+    resume_task = asyncio.create_task(resume_unfinished_recording())
     yield
-    idle_task.cancel()
+    resume_task.cancel()
+    await asyncio.to_thread(sidecar_ctl.stop, True)
 
 
 app = FastAPI(title="StenoPod", lifespan=lifespan)
@@ -188,7 +740,7 @@ async def index() -> FileResponse:
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
     llm_ok = await summarizer.healthy()
-    return {"app": True, "llm": llm_ok, "sidecar": public_state()["sidecar"]}
+    return {"app": True, "llm": llm_ok, "sidecar": public_state()["sidecar"], "capture": sidecar_ctl.status()}
 
 
 @app.get("/api/state")
@@ -217,21 +769,25 @@ async def add_segment(body: IngestSegment) -> dict[str, Any]:
         if len(store.current.segments) == 1 and store.current.title == "Untitled session":
             store.current.title = text[:72]
         store.save()
-        pending_len = len(store.current.pending_text())
     await broadcast({"type": "segment", "segment": segment.model_dump(), "state": public_state()})
-    if pending_len >= AUTO_SUMMARY_CHARS:
-        asyncio.create_task(maybe_summarize("chars"))
     return {"ok": True, "id": segment.id}
 
 
 @app.post("/api/sidecar")
 async def sidecar_heartbeat(body: SidecarStatus) -> dict[str, Any]:
+    if body.listening and suppress_listening:
+        if body.wav:
+            sidecar_state["wav"] = body.wav
+        return {"ok": True}
     sidecar_state.update(
         {
             "listening": body.listening,
             "device": body.device,
             "source": body.source,
             "model": body.model,
+            "phase": body.phase,
+            "recorded_s": body.recorded_s,
+            "wav": body.wav,
             "last_seen": utc_now(),
         }
     )
@@ -239,16 +795,263 @@ async def sidecar_heartbeat(body: SidecarStatus) -> dict[str, Any]:
     return {"ok": True}
 
 
+@app.post("/api/progress")
+async def job_progress(request: Request, body: ProgressBody) -> dict[str, Any]:
+    require_local(request)
+    stage = (body.stage or "pyannote").strip().lower()
+    name = STAGE_NAMES.get(stage, stage)
+    chunks = max(0, int(body.chunks or 0))
+    chunk = max(0, int(body.chunk or 0))
+    progress = body.progress
+    if progress is None or not math.isfinite(float(progress)):
+        progress = None
+    else:
+        progress = max(0.0, min(1.0, float(progress)))
+    if stage == "load":
+        label = "Loading speakers and Whisper"
+        progress = None
+    elif stage == "pyannote":
+        label = "Speakers"
+    elif stage == "whisper" and chunks > 0:
+        label = f"Whisper · {chunk} of {chunks}"
+    elif chunks > 0:
+        label = f"{name} · {chunk} of {chunks}"
+    else:
+        label = name
+    async with lock:
+        session = store.current
+        session.job_kind = "transcribe"
+        session.job_stage = stage
+        session.job_progress = progress
+        session.job_label = label
+        session.job_chunk = chunk
+        session.job_chunks = chunks
+    await broadcast({"type": "state", "state": public_state()})
+    return {"ok": True}
+
+
+@app.post("/api/capture/start")
+async def capture_start(request: Request, body: CaptureStartBody | None = None) -> dict[str, Any]:
+    global ui_recording
+    require_local(request)
+    payload = body or CaptureStartBody()
+    if ui_recording or recording_active():
+        raise HTTPException(409, "A recording is already running.")
+    if job_busy():
+        raise HTTPException(409, "Wait for transcription and notes to finish.")
+    existing = store.current.audio_path
+    if existing and Path(existing).is_file():
+        dur = store.current.audio_duration_s
+        if dur <= 0:
+            try:
+                dur = sidecar_ctl.wav_duration_s(existing)
+            except Exception:
+                dur = 0
+        if dur > 1.0:
+            raise HTTPException(409, "This meeting already has a recording. Start a new meeting first.")
+    try:
+        result = await asyncio.to_thread(
+            sidecar_ctl.start,
+            payload.source,
+            payload.mic_device,
+            APP_URL,
+            "pyannote",
+            store.current.id,
+            None,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(500, str(exc)) from exc
+    if result.get("already"):
+        raise HTTPException(409, "A recording is already running.")
+    ui_recording = True
+    wav = result.get("wav")
+    async with lock:
+        store.current.capture_source = payload.source
+        store.current.audio_cursor_s = 0.0
+        store.current.audio_duration_s = 0.0
+        store.current.transcribe_error = None
+        if wav:
+            store.current.audio_path = str(wav)
+        store.save()
+    await broadcast({"type": "state", "state": public_state()})
+    return {**result, "state": public_state()}
+
+
+@app.post("/api/capture/stop")
+async def capture_stop(request: Request, body: SpeakerBounds | None = None) -> dict[str, Any]:
+    global ui_recording, suppress_listening
+    require_local(request)
+    ui_recording = False
+    suppress_listening = True
+    sidecar_state["listening"] = False
+    sidecar_state["phase"] = None
+    sidecar_state["last_seen"] = None
+    path = store.current.audio_path or sidecar_state.get("wav")
+    try:
+        result = await asyncio.to_thread(sidecar_ctl.stop)
+    finally:
+        suppress_listening = False
+        sidecar_state["listening"] = False
+        sidecar_state["phase"] = None
+        sidecar_state["last_seen"] = None
+    should = False
+    async with lock:
+        if path:
+            store.current.audio_path = str(path)
+        wav = store.current.audio_path
+        dur = 0.0
+        if wav and Path(wav).is_file():
+            try:
+                dur = sidecar_ctl.wav_duration_s(wav)
+                store.current.audio_duration_s = dur
+                resolved = str(Path(wav).resolve())
+                st = Path(wav).stat()
+                _duration_cache[resolved] = (st.st_mtime_ns, st.st_size, dur)
+            except Exception:
+                log.exception("Could not read wav duration after stop")
+        cursor = float(store.current.audio_cursor_s or 0.0)
+        already = len(store.current.segments) > 0 and cursor >= max(0.0, dur - 1.0)
+        if dur >= 1.0 and not already:
+            should = True
+            store.current.transcribe_error = None
+        elif dur < 1.0:
+            store.current.transcribe_error = "Recording is too short to transcribe."
+        store.save()
+    await broadcast({"type": "state", "state": public_state()})
+    if should:
+        try:
+            bounds = body or SpeakerBounds()
+            state = await begin_transcription(bounds.min_speakers, bounds.max_speakers)
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, str) else "Transcription did not start."
+            log.warning("Transcription did not start after stop: %s", detail)
+            async with lock:
+                store.current.transcribe_error = detail
+                store.save()
+            await broadcast({"type": "state", "state": public_state()})
+            return {**result, "state": public_state(), "transcribe_started": False}
+        return {**result, "state": state, "transcribe_started": True}
+    return {**result, "state": public_state(), "transcribe_started": False}
+
+
+@app.post("/api/transcribe")
+async def transcribe_now(body: SpeakerBounds | None = None) -> dict[str, Any]:
+    bounds = body or SpeakerBounds()
+    return await begin_transcription(bounds.min_speakers, bounds.max_speakers)
+
+
+@app.post("/api/recordings/open")
+async def open_recording(body: RecordingBody) -> dict[str, Any]:
+    if job_busy():
+        raise HTTPException(409, "Wait for recording, transcription, and notes to finish.")
+    wav = capture_wav(body.path)
+    try:
+        dur = await asyncio.to_thread(cached_wav_duration, wav)
+    except Exception as exc:
+        raise HTTPException(400, f"Could not read the recording: {exc}") from exc
+    async with lock:
+        activate_recording(wav, dur, restart=False)
+    await broadcast({"type": "state", "state": public_state()})
+    return public_state()
+
+
+@app.post("/api/recordings/transcribe")
+async def transcribe_recording(body: RecordingBody) -> dict[str, Any]:
+    if job_busy():
+        raise HTTPException(409, "Wait for recording, transcription, and notes to finish.")
+    wav = capture_wav(body.path)
+    try:
+        dur = await asyncio.to_thread(cached_wav_duration, wav)
+    except Exception as exc:
+        raise HTTPException(400, f"Could not read the recording: {exc}") from exc
+    if dur < 1.0:
+        raise HTTPException(400, "Recording is too short to transcribe.")
+    async with lock:
+        activate_recording(wav, dur, restart=body.restart)
+        done = (
+            not body.restart
+            and len(store.current.segments) > 0
+            and float(store.current.audio_cursor_s or 0.0) >= dur - 1.0
+        )
+    await broadcast({"type": "state", "state": public_state()})
+    if done:
+        return public_state()
+    return await begin_transcription(body.min_speakers, body.max_speakers)
+
+
+@app.post("/api/recordings/delete")
+async def delete_recording(body: RecordingBody) -> dict[str, Any]:
+    if job_busy():
+        raise HTTPException(409, "Wait for recording, transcription, and notes to finish.")
+    wav = capture_wav(body.path)
+    async with lock:
+        removed = store.forget_wav(wav)
+        _duration_cache.pop(str(wav.resolve()), None)
+        for session_id in removed:
+            _rerun_backup.pop(session_id, None)
+        pointed = sidecar_state.get("wav")
+        if pointed:
+            try:
+                same = Path(str(pointed)).resolve() == wav.resolve()
+            except OSError:
+                same = False
+            if same:
+                sidecar_state["wav"] = store.current.audio_path
+                sidecar_state["recorded_s"] = None
+    await broadcast({"type": "state", "state": public_state()})
+    return public_state()
+
+
 @app.post("/api/summarize")
 async def summarize_now() -> dict[str, Any]:
+    if ui_recording or recording_active():
+        raise HTTPException(409, "Stop recording before updating notes.")
+    if store.current.transcribing or transcribe_running():
+        raise HTTPException(409, "Wait for transcription to finish.")
+    if not store.current.segments:
+        raise HTTPException(400, "Transcribe the recording before writing notes.")
     await maybe_summarize("manual", force=True)
     return public_state()
 
 
 @app.post("/api/session")
 async def new_session() -> dict[str, Any]:
+    if ui_recording or recording_active():
+        raise HTTPException(409, "Stop recording before starting a new meeting.")
     async with lock:
+        if job_busy():
+            raise HTTPException(409, "Wait for transcription and notes to finish.")
         store.new_session()
+    sidecar_state["listening"] = False
+    sidecar_state["wav"] = None
+    sidecar_state["recorded_s"] = None
+    sidecar_state["phase"] = None
+    await broadcast({"type": "state", "state": public_state()})
+    return public_state()
+
+
+@app.post("/api/speakers/voices")
+async def match_voices(request: Request, body: VoiceBody) -> dict[str, Any]:
+    require_local(request)
+    async with lock:
+        session_id = store.current.id
+        pairs: list[tuple[str, list[float]]] = []
+        for item in body.speakers:
+            letter = item.id.strip().upper()[:1]
+            if not letter.isalpha():
+                continue
+            store.current.speaker_embeddings[letter] = list(item.embedding)
+            pairs.append((letter, list(item.embedding)))
+        store.save()
+    matched: dict[str, str] = {}
+    if pairs:
+        matched = await asyncio.to_thread(voices.identify, pairs)
+    async with lock:
+        if store.current.id == session_id:
+            for letter, name in matched.items():
+                if not str(store.current.speaker_names.get(letter) or "").strip():
+                    store.current.speaker_names[letter] = name
+            store.save()
     await broadcast({"type": "state", "state": public_state()})
     return public_state()
 
@@ -259,8 +1062,12 @@ async def rename_speaker(body: SpeakerNameBody) -> dict[str, Any]:
     if not speaker_id.isalpha():
         raise HTTPException(400, "invalid speaker id")
     async with lock:
-        store.current.speaker_names[speaker_id] = body.name.strip()
+        name = body.name.strip()
+        store.current.speaker_names[speaker_id] = name
+        embedding = store.current.speaker_embeddings.get(speaker_id) or []
         store.save()
+    if embedding:
+        await asyncio.to_thread(voices.remember, name, embedding)
     await broadcast({"type": "state", "state": public_state()})
     return public_state()
 

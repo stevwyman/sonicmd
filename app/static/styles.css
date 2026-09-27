@@ -106,7 +106,57 @@ h1 {
 .lamp.bad i { background: var(--rh-bad); box-shadow: 0 0 0 3px rgba(201, 25, 11, 0.35); }
 .lamp.bad .lamp-state { color: #f9c5c1; }
 
-.actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.menu { position: relative; }
+.menu-panel {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  min-width: 11rem;
+  background: #1f1f1f;
+  border: 1px solid #6a6e73;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+}
+.menu-panel[hidden] { display: none; }
+.menu-panel a {
+  color: #fff;
+  text-decoration: none;
+  padding: 8px 12px;
+  border: 0;
+}
+.menu-panel a:hover { background: #3c3f42; border: 0; }
+.actions select {
+  font-family: var(--type);
+  font-size: 14px;
+  font-weight: 500;
+  color: #fff;
+  background: #1f1f1f;
+  border: 1px solid #6a6e73;
+  padding: 6px 10px;
+}
+.spk-bounds {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 500;
+}
+.spk-bounds input {
+  width: 4.2rem;
+  font-family: var(--type);
+  font-size: 14px;
+  color: #fff;
+  background: #1f1f1f;
+  border: 1px solid #6a6e73;
+  padding: 6px 8px;
+}
+button#btn-capture.stop {
+  background: transparent;
+  border-color: #6a6e73;
+}
 button, a.ghost {
   font-family: var(--type);
   font-size: 14px;
@@ -126,6 +176,12 @@ button {
 button:hover { background: var(--rh-red-dark); border-color: var(--rh-red-dark); }
 button.ghost, a.ghost { background: transparent; color: #fff; }
 button.ghost:hover, a.ghost:hover { border-color: #fff; }
+button:disabled, select:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+button:disabled:hover { background: var(--rh-red); border-color: var(--rh-red); }
+button.ghost:disabled:hover { background: transparent; border-color: #6a6e73; }
 
 .meta {
   display: flex;
@@ -146,7 +202,114 @@ button.ghost:hover, a.ghost:hover { border-color: #fff; }
   padding: 4px 0;
 }
 #counts { font-family: var(--mono); font-size: 12px; color: var(--rh-gray-600); }
-.device { margin: 0 0 18px; font-family: var(--mono); font-size: 12px; color: var(--rh-gray-600); min-height: 1em; }
+.device { margin: 0 0 10px; font-family: var(--mono); font-size: 12px; color: var(--rh-gray-600); min-height: 1em; }
+.job { margin: 0 0 18px; }
+.job-label { margin: 0 0 6px; font-family: var(--mono); font-size: 12px; color: var(--rh-gray-600); }
+.job-bar {
+  height: 8px;
+  background: var(--rh-gray-200);
+  border-radius: 99px;
+  overflow: hidden;
+}
+.job-bar i {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--rh-red);
+}
+.job-bar.indeterminate i {
+  width: 35%;
+  animation: job-slide 1.1s ease-in-out infinite;
+}
+@keyframes job-slide {
+  0% { transform: translateX(-120%); }
+  100% { transform: translateX(320%); }
+}
+
+.recordings {
+  margin: 0 0 16px;
+  padding: 12px 16px;
+  background: #fff;
+  border: 1px solid var(--rh-gray-200);
+}
+.recordings .rec-toggle {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0;
+  padding: 2px 0;
+  background: transparent;
+  border: 0;
+  color: var(--rh-black);
+  font-family: var(--display);
+  font-size: 0.95rem;
+  font-weight: 700;
+  text-align: left;
+}
+.recordings .rec-toggle:hover { background: transparent; border: 0; color: var(--rh-black); }
+.recordings .rec-chevron { font-family: var(--mono); font-weight: 400; color: var(--rh-gray-600); }
+#rec-panel { margin-top: 8px; }
+.recordings ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 280px;
+  overflow: auto;
+}
+.recordings li {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 0;
+  border-top: 1px solid var(--rh-gray-200);
+}
+.recordings li.current { box-shadow: inset 3px 0 0 var(--rh-red); padding-left: 10px; }
+.recordings .rec-main { flex: 1; min-width: 0; }
+.recordings .rec-main b {
+  display: block;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.recordings .rec-main span {
+  display: block;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--rh-gray-600);
+}
+.recordings .rec-actions { display: flex; flex-wrap: wrap; gap: 8px; flex-shrink: 0; justify-content: flex-end; }
+.recordings button.danger { color: var(--rh-bad); }
+.recordings button {
+  background: #fff;
+  color: var(--rh-black);
+  border: 1px solid var(--rh-gray-300);
+  padding: 4px 10px;
+  font-size: 13px;
+}
+.recordings button:hover { background: var(--rh-gray-100); border-color: var(--rh-gray-500); }
+.recordings button.primary {
+  background: var(--rh-red);
+  border-color: var(--rh-red);
+  color: #fff;
+}
+.recordings button.primary:hover { background: var(--rh-red-dark); border-color: var(--rh-red-dark); }
+.recordings button:disabled,
+.recordings button:disabled:hover {
+  background: #fff;
+  color: var(--rh-gray-600);
+  border-color: var(--rh-gray-300);
+  opacity: 0.45;
+}
+.recordings button.primary:disabled,
+.recordings button.primary:disabled:hover {
+  background: var(--rh-red);
+  border-color: var(--rh-red);
+  color: #fff;
+}
+.rec-empty { margin: 0 0 8px; color: var(--rh-gray-600); font-size: 0.95rem; }
 
 .split {
   display: grid;
@@ -190,6 +353,36 @@ h2 {
   padding: 4px 8px;
 }
 .roster button:hover { border-color: var(--rh-black); }
+.roster form.rename {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.roster form.rename input {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--rh-black);
+  background: #fff;
+  border: 1px solid var(--rh-black);
+  padding: 4px 8px;
+  width: 11rem;
+}
+.roster form.rename button {
+  background: var(--rh-black);
+  color: #fff;
+  border-color: var(--rh-black);
+  padding: 4px 8px;
+}
+.roster form.rename button:hover {
+  background: var(--rh-black);
+  border-color: var(--rh-black);
+}
+.hint {
+  margin: -8px 0 14px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--rh-gray-600);
+}
 .roster .bar {
   display: inline-block;
   width: 48px;
@@ -236,6 +429,8 @@ h2 {
   font-size: inherit;
   font-weight: 500;
   cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 .takes .body { color: var(--rh-black); }
 

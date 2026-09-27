@@ -228,3 +228,5 @@ data/*
 !data/.gitkeep
 .venv-host/
 .venv-app/
+.run/
+.tools/

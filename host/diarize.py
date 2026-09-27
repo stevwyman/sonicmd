@@ -15,6 +15,19 @@ ECAPA_URL = (
 ECAPA_NAME = "ecapa_tdnn.onnx"
 
 
+def configure_ssl() -> None:
+    """Point urllib/OpenSSL at certifi. macOS Python often has an empty default CA store."""
+    try:
+        import certifi
+
+        ca = certifi.where()
+        os.environ.setdefault("SSL_CERT_FILE", ca)
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", ca)
+        os.environ.setdefault("CURL_CA_BUNDLE", ca)
+    except Exception:
+        return
+
+
 def _l2(vec: np.ndarray) -> np.ndarray:
     n = float(np.linalg.norm(vec))
     if n < 1e-9:
@@ -48,6 +61,11 @@ def logmel_embed(audio: np.ndarray, sr: int = SAMPLE_RATE) -> np.ndarray:
         region_parts.append(mean_f[:32])
     region = np.concatenate(region_parts).astype(np.float64)
     return _l2(np.concatenate([band_means, band_stds, region]))
+
+
+class SpectralEmbedder:
+    def embed(self, audio: np.ndarray) -> np.ndarray:
+        return logmel_embed(audio)
 
 
 class EcapaEmbedder:
@@ -100,7 +118,7 @@ class SpeakerBank:
         self,
         threshold: float = 0.62,
         stay_bonus: float = 0.03,
-        max_speakers: int = 8,
+        max_speakers: int | None = None,
         lang_override: float = 0.88,
     ) -> None:
         self.threshold = threshold
@@ -198,7 +216,7 @@ class SpeakerBank:
             self._remember(chosen, embedding, lang)
             return chosen.letter, raw
 
-        if fallback is not None and len(self.speakers) >= self.max_speakers:
+        if fallback is not None and self.max_speakers is not None and len(self.speakers) >= self.max_speakers:
             self._remember(fallback, embedding, lang)
             return fallback.letter, fallback_sim
 
@@ -220,11 +238,17 @@ def download_ecapa(dest: Path) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and dest.stat().st_size > 1_000_000:
         return dest
-    import urllib.request
+    import httpx
 
-    print(f"Downloading speaker model → {dest} (~80 MB, once) …")
+    configure_ssl()
+    print(f"Downloading speaker model → {dest} (~80 MB, once) …", flush=True)
     tmp = dest.with_suffix(".partial")
-    urllib.request.urlretrieve(ECAPA_URL, tmp)
+    with httpx.Client(follow_redirects=True, timeout=120.0) as client:
+        with client.stream("GET", ECAPA_URL) as response:
+            response.raise_for_status()
+            with tmp.open("wb") as out:
+                for chunk in response.iter_bytes():
+                    out.write(chunk)
     tmp.replace(dest)
     return dest
 
@@ -236,9 +260,7 @@ def load_embedder() -> tuple[object, str]:
         return EcapaEmbedder(path), "ecapa"
     except Exception as exc:
         print(f"ECAPA unavailable ({exc}); using spectral fallback.", flush=True)
+        return SpectralEmbedder(), "spectral"
 
-        class Fallback:
-            def embed(self, audio: np.ndarray) -> np.ndarray:
-                return logmel_embed(audio)
 
-        return Fallback(), "spectral"
+configure_ssl()

@@ -41,11 +41,27 @@ class Session(BaseModel):
     started_at: datetime = Field(default_factory=utc_now)
     segments: list[Segment] = Field(default_factory=list)
     speaker_names: dict[str, str] = Field(default_factory=dict)
+    speaker_embeddings: dict[str, list[float]] = Field(default_factory=dict)
+    min_speakers: int | None = None
+    max_speakers: int | None = None
+    speaker_bounds_saved: bool = False
     notes: str = ""
     notes_updated_at: datetime | None = None
     last_summarized_index: int = 0
     summarizing: bool = Field(default=False, exclude=True)
+    transcribing: bool = Field(default=False, exclude=True)
     summary_error: str | None = None
+    transcribe_error: str | None = None
+    audio_path: str | None = None
+    audio_cursor_s: float = 0.0
+    audio_duration_s: float = 0.0
+    capture_source: str | None = None
+    job_kind: str | None = Field(default=None, exclude=True)
+    job_stage: str | None = Field(default=None, exclude=True)
+    job_progress: float | None = Field(default=None, exclude=True)
+    job_label: str | None = Field(default=None, exclude=True)
+    job_chunk: int = Field(default=0, exclude=True)
+    job_chunks: int = Field(default=0, exclude=True)
 
     def speaker_label(self, speaker: str) -> str:
         custom = self.speaker_names.get(speaker, "").strip()
@@ -135,7 +151,7 @@ class Session(BaseModel):
         return "\n".join(lines)
 
     def snapshot(self) -> dict[str, Any]:
-        recent = self.segments[-80:]
+        recent = self.segments[-400:]
         return {
             "id": self.id,
             "title": self.title,
@@ -145,9 +161,30 @@ class Session(BaseModel):
             "notes_updated_at": iso(self.notes_updated_at) if self.notes_updated_at else None,
             "pending_chars": len(self.pending_text()),
             "summarizing": self.summarizing,
+            "transcribing": self.transcribing,
             "summary_error": self.summary_error,
+            "transcribe_error": self.transcribe_error,
             "speaker_names": self.speaker_names,
+            "min_speakers": self.min_speakers,
+            "max_speakers": self.max_speakers,
+            "speaker_bounds_saved": self.speaker_bounds_saved,
             "speakers": self.speaker_stats(),
             "blocks": self.blocks(recent),
             "segments": [s.model_dump() for s in recent],
+            "audio_path": self.audio_path,
+            "audio_cursor_s": self.audio_cursor_s,
+            "audio_duration_s": self.audio_duration_s,
+            "capture_source": self.capture_source,
+            "job": (
+                {
+                    "kind": self.job_kind,
+                    "stage": self.job_stage,
+                    "progress": self.job_progress,
+                    "label": self.job_label,
+                    "chunk": self.job_chunk,
+                    "chunks": self.job_chunks,
+                }
+                if self.job_kind
+                else None
+            ),
         }

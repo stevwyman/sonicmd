@@ -10,7 +10,7 @@
       rel="stylesheet"
       href="https://fonts.googleapis.com/css2?family=Red+Hat+Display:wght@500;700&family=Red+Hat+Mono:wght@400;500&family=Red+Hat+Text:wght@400;500&display=swap"
     />
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260927b" />
   </head>
   <body>
     <header class="mast">
@@ -19,7 +19,7 @@
           <span class="mark" aria-hidden="true"></span>
           <div>
             <h1>StenoPod</h1>
-            <p class="tag">Live transcript · local notes</p>
+            <p class="tag">Transcription starts when recording stops</p>
           </div>
         </div>
         <div class="lamps" aria-label="Status">
@@ -28,10 +28,22 @@
           <span class="lamp" id="lamp-sum"><i></i><span class="lamp-name">Notes</span><span class="lamp-state">idle</span></span>
         </div>
         <div class="actions">
-          <button type="button" id="btn-summarize">Update notes</button>
-          <button type="button" class="ghost" id="btn-new">New session</button>
-          <a class="ghost" href="/api/transcript.txt">Transcript</a>
-          <a class="ghost" href="/api/notes.md">Notes.md</a>
+          <select id="capture-source" aria-label="What to record">
+            <option value="both" selected>StenoPod Headphones · system + mic</option>
+            <option value="system">StenoPod Speakers · system audio</option>
+          </select>
+          <label class="spk-bounds">Min <input id="spk-min" type="number" inputmode="numeric" min="1" max="12" placeholder="auto" aria-label="Minimum speakers" /></label>
+          <label class="spk-bounds">Max <input id="spk-max" type="number" inputmode="numeric" min="1" max="12" placeholder="auto" aria-label="Maximum speakers" /></label>
+          <button type="button" class="ghost" id="btn-new">New meeting</button>
+          <button type="button" id="btn-capture">Start recording</button>
+          <button type="button" id="btn-transcribe" disabled>Transcribe</button>
+          <div class="menu" id="download-menu">
+            <button type="button" class="ghost" id="btn-download" aria-haspopup="true" aria-expanded="false" aria-controls="download-panel">Download</button>
+            <div class="menu-panel" id="download-panel" role="menu" hidden>
+              <a role="menuitem" href="/api/transcript.txt">Transcript</a>
+              <a role="menuitem" href="/api/notes.md">Notes.md</a>
+            </div>
+          </div>
         </div>
       </div>
     </header>
@@ -42,22 +54,40 @@
         <span id="counts"></span>
       </p>
       <p class="device" id="device"></p>
+      <div id="job" class="job" hidden>
+        <p id="job-label" class="job-label"></p>
+        <div id="job-bar" class="job-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <i id="job-fill"></i>
+        </div>
+      </div>
+
+      <section class="recordings" aria-labelledby="rec-h">
+        <button type="button" class="rec-toggle" id="rec-toggle" aria-expanded="false" aria-controls="rec-panel">
+          <span id="rec-h">Recordings <span id="rec-count"></span></span>
+          <span class="rec-chevron" aria-hidden="true">▸</span>
+        </button>
+        <div id="rec-panel" hidden>
+          <ul id="recordings"></ul>
+          <p class="rec-empty" id="rec-empty">Saved recordings show up here.</p>
+        </div>
+      </section>
 
       <main class="split">
         <section class="pad" aria-labelledby="tx-h">
           <h2 id="tx-h">Transcript</h2>
           <ul id="roster" class="roster" aria-label="Speakers"></ul>
+          <p class="hint" id="rename-hint" hidden>Click a speaker to rename.</p>
           <ol id="transcript" class="takes"></ol>
-          <p class="empty" id="tx-empty">Waiting for the Metal sidecar. Play audio through the BlackHole multi-output, then run <code>make sidecar</code>.</p>
+          <p class="empty" id="tx-empty">Choose StenoPod Speakers or Headphones, then press <strong>Start recording</strong>. Transcription starts when you stop.</p>
         </section>
         <section class="copy" aria-labelledby="nt-h">
           <h2 id="nt-h">Markdown notes</h2>
           <article id="notes" class="prose"></article>
-          <p class="empty" id="nt-empty">Notes appear after enough new speech, or when you press Update notes.</p>
+          <p class="empty" id="nt-empty">Notes are written after transcription finishes.</p>
           <p class="err" id="nt-err" hidden></p>
         </section>
       </main>
     </div>
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=20260927e"></script>
   </body>
 </html>

@@ -80,14 +80,7 @@ function speakerColor(id) {
 }
 
 async function renameSpeaker(id, current) {
-  const name = prompt(`Name for Speaker ${id}`, current || `Speaker ${id}`);
-  if (!name) return;
-  const r = await fetch("/api/speakers", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ id, name: name.trim() }),
-  });
-  render(await r.json());
+  startRename(id, current);
 }
 
 function setLamp(id, mode) {
@@ -108,26 +101,271 @@ function setLamp(id, mode) {
   }
 }
 
+function formatClock(s) {
+  const n = Math.max(0, Math.round(Number(s) || 0));
+  const m = Math.floor(n / 60);
+  const r = n % 60;
+  return `${m}:${String(r).padStart(2, "0")}`;
+}
+
+const ROUTES = {
+  both: "StenoPod Headphones · system + mic. Set Sound → Output to StenoPod Headphones, and Input to the Mac microphone.",
+  system: "StenoPod Speakers · system audio only. Set Sound → Output to StenoPod Speakers.",
+};
+
+let lastState = null;
+let renamingId = null;
+let renameDraft = "";
+let pendingJob = null;
+let pollTimer = null;
+
+function formatDay(iso) {
+  try {
+    return new Date(iso).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  } catch {
+    return "";
+  }
+}
+
+function activeJob(state, serverBusy) {
+  if (serverBusy && state.job && state.job.label) return state.job;
+  return pendingJob;
+}
+
+function ensurePoll(busy) {
+  if (busy && !pollTimer) {
+    pollTimer = setInterval(() => {
+      fetchState().catch(() => {});
+    }, 1500);
+  } else if (!busy && pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+}
+
+function renderRecordings(rows, busy) {
+  const ul = $("recordings");
+  const empty = $("rec-empty");
+  if (!ul || !empty) return;
+  const items = rows || [];
+  const count = $("rec-count");
+  if (count) count.textContent = items.length ? `(${items.length})` : "";
+  empty.hidden = items.length > 0;
+  const key = `${busy ? 1 : 0}|${items
+    .map((row) =>
+      [
+        row.path,
+        row.title,
+        row.current ? 1 : 0,
+        row.transcribed ? 1 : 0,
+        row.too_short ? 1 : 0,
+        row.segments,
+        Math.round(Number(row.duration_s) || 0),
+      ].join("\t"),
+    )
+    .join("\n")}`;
+  if (key === ul.dataset.key) return;
+  ul.dataset.key = key;
+  ul.innerHTML = "";
+  items.forEach((row, index) => {
+    const li = document.createElement("li");
+    if (row.current) li.classList.add("current");
+    let status = "Not transcribed";
+    if (row.too_short) status = "Too short to transcribe";
+    else if (row.transcribed) status = `Transcribed · ${row.segments} takes`;
+    else if (row.segments > 0) status = `${row.segments} takes · not finished`;
+    const when = formatDay(row.recorded_at);
+    li.innerHTML = `<div class="rec-main"><b></b><span></span></div><div class="rec-actions"></div>`;
+    li.querySelector("b").textContent = row.title || row.name;
+    li.querySelector("span").textContent = `${when} · ${formatClock(row.duration_s)} · ${status}`;
+    const actions = li.querySelector(".rec-actions");
+    if (!row.current) {
+      const open = document.createElement("button");
+      open.type = "button";
+      open.textContent = "Open";
+      open.dataset.action = "open";
+      open.dataset.index = String(index);
+      open.disabled = busy;
+      actions.appendChild(open);
+    }
+    if (!row.too_short) {
+      const run = document.createElement("button");
+      run.type = "button";
+      run.className = "primary";
+      run.dataset.action = row.transcribed ? "again" : "transcribe";
+      run.dataset.index = String(index);
+      run.textContent = row.transcribed ? "Transcribe again" : row.segments > 0 ? "Continue" : "Transcribe";
+      run.disabled = busy;
+      actions.appendChild(run);
+    }
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "danger";
+    remove.textContent = "Delete";
+    remove.dataset.action = "delete";
+    remove.dataset.index = String(index);
+    remove.disabled = busy;
+    actions.appendChild(remove);
+    ul.appendChild(li);
+  });
+}
+
+async function commitRename(id, name) {
+  const trimmed = name.trim();
+  renamingId = null;
+  renameDraft = "";
+  if (!trimmed) {
+    if (lastState) render(lastState);
+    return;
+  }
+  const r = await fetch("/api/speakers", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id, name: trimmed }),
+  });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    alert(apiError(body, r.statusText));
+    if (lastState) render(lastState);
+    return;
+  }
+  render(body);
+}
+
+function startRename(id, current) {
+  renamingId = id;
+  renameDraft = current || "";
+  if (lastState) render(lastState);
+  const input = document.querySelector("#roster .rename input");
+  if (input) {
+    input.focus();
+    input.select();
+  }
+}
+
+function speakerChip(sp, editing) {
+  const li = document.createElement("li");
+  if (editing) {
+    li.innerHTML = `<form class="rename"><input maxlength="40" aria-label="Name for speaker ${escapeHtml(sp.id)}" value="${escapeHtml(renameDraft)}"><button type="submit">Save</button></form>`;
+    const form = li.querySelector("form");
+    const input = form.querySelector("input");
+    input.addEventListener("input", () => {
+      renameDraft = input.value;
+    });
+    form.addEventListener("submit", (ev) => {
+      ev.preventDefault();
+      commitRename(sp.id, input.value);
+    });
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        renamingId = null;
+        renameDraft = "";
+        if (lastState) render(lastState);
+      }
+    });
+    return li;
+  }
+  const pct = Math.round((sp.share || 0) * 100);
+  li.innerHTML = `<button type="button" title="Rename ${escapeHtml(sp.name)}" style="--spk:${speakerColor(sp.id)}"><span class="bar"><i style="width:${pct}%"></i></span>${escapeHtml(sp.name)} · ${escapeHtml(sp.duration)} · ${sp.turns} turns</button>`;
+  li.querySelector("button").addEventListener("click", () => startRename(sp.id, sp.name));
+  return li;
+}
+
+function renderJob(job) {
+  const box = $("job");
+  const bar = $("job-bar");
+  const fill = $("job-fill");
+  if (!job || !job.label) {
+    box.hidden = true;
+    bar.classList.remove("indeterminate");
+    fill.style.width = "0";
+    return;
+  }
+  box.hidden = false;
+  $("job-label").textContent = job.label;
+  const pct = job.progress == null ? null : Math.round(Math.max(0, Math.min(1, Number(job.progress))) * 100);
+  if (pct == null) {
+    bar.classList.add("indeterminate");
+    bar.removeAttribute("aria-valuenow");
+    fill.style.width = "";
+  } else {
+    bar.classList.remove("indeterminate");
+    bar.setAttribute("aria-valuenow", String(pct));
+    fill.style.width = `${pct}%`;
+  }
+}
+
 function render(state) {
-  $("title").value = state.title || "";
-  const speakers = state.speakers || [];
-  $("counts").textContent = `${state.segment_count || 0} takes · ${speakers.length} speakers · ${state.pending_chars || 0} chars pending`;
-  const sc = state.sidecar || {};
-  $("device").textContent = sc.listening
-    ? `Listening · ${sc.device || "audio"} · ${sc.model || "whisper"}`
-    : "Sidecar idle — start with make sidecar";
-  setLamp("lamp-listen", sc.listening ? "on" : "");
+  if (lastState && state.id !== lastState.id) {
+    renamingId = null;
+    renameDraft = "";
+  }
+  lastState = state;
+  const listening = Boolean(state.sidecar && state.sidecar.listening);
+  const serverBusy = Boolean(state.transcribing || state.summarizing || (state.job && state.job.kind));
+  const job = activeJob(state, serverBusy);
+  const busy = serverBusy || Boolean(pendingJob);
+  const duration = listening ? state.sidecar.recorded_s : state.audio_duration_s;
+  const hasRecording = !listening && (Number(duration) > 1 || Boolean(state.audio_path));
+  const transcribed =
+    hasRecording && Number(state.audio_cursor_s) >= Number(duration) - 1 && (state.segment_count || 0) > 0;
+  const sel = $("capture-source");
+  if (document.activeElement !== sel && state.capture_source && sel.value !== state.capture_source && !listening) {
+    sel.value = state.capture_source;
+  }
+
+  if (document.activeElement !== $("title")) {
+    $("title").value = state.title || "";
+  }
+  applySavedBounds(state);
+  $("counts").textContent = `${state.segment_count || 0} takes · ${(state.speakers || []).length} speakers`;
+
+  const route = ROUTES[sel.value] || ROUTES.both;
+  const showJob = Boolean(busy && job && job.label);
+  $("device").hidden = showJob;
+  if (showJob) {
+    setLamp("lamp-listen", "busy");
+  } else if (listening) {
+    $("device").textContent = `Recording ${formatClock(duration)}. Transcription starts when you stop. ${route}`;
+    setLamp("lamp-listen", "on");
+  } else if (state.transcribe_error) {
+    const lines = String(state.transcribe_error).split("\n").map((line) => line.trim()).filter(Boolean);
+    $("device").textContent = lines[lines.length - 1] || "Transcription failed.";
+    setLamp("lamp-listen", "");
+  } else if (hasRecording && !transcribed) {
+    $("device").textContent = `Recording saved · ${formatClock(duration)}. Press Transcribe.`;
+    setLamp("lamp-listen", "");
+  } else if (transcribed) {
+    $("device").textContent = `Transcribed · ${formatClock(duration)}.`;
+    setLamp("lamp-listen", "");
+  } else {
+    $("device").textContent = route;
+    setLamp("lamp-listen", "");
+  }
+  renderJob(busy ? job : null);
+  renderRecordings(state.recordings, busy || listening);
+  ensurePoll(busy);
   setLamp("lamp-sum", state.summarizing ? "busy" : state.notes ? "on" : "");
 
+  sel.disabled = listening || busy || hasRecording;
+  $("spk-min").disabled = busy;
+  $("spk-max").disabled = busy;
+  $("btn-new").disabled = listening || busy;
+  $("btn-transcribe").disabled = listening || busy || !hasRecording || transcribed;
+  syncCaptureButton(listening, Boolean(state.capture && state.capture.running), busy, hasRecording);
+
   const roster = $("roster");
-  roster.innerHTML = "";
-  for (const sp of speakers) {
-    const li = document.createElement("li");
-    const pct = Math.round((sp.share || 0) * 100);
-    li.innerHTML = `<button type="button" style="--spk:${speakerColor(sp.id)}"><span class="bar"><i style="width:${pct}%"></i></span>${escapeHtml(sp.name)} · ${escapeHtml(sp.duration)} · ${sp.turns} turns</button>`;
-    li.querySelector("button").addEventListener("click", () => renameSpeaker(sp.id, sp.name));
-    roster.appendChild(li);
+  const renameInput = document.querySelector("#roster .rename input");
+  const preserveRename = Boolean(renamingId && renameInput && document.activeElement === renameInput);
+  if (!preserveRename) {
+    roster.innerHTML = "";
+    for (const sp of state.speakers || []) {
+      roster.appendChild(speakerChip(sp, renamingId === sp.id));
+    }
   }
+  const hint = $("rename-hint");
+  if (hint) hint.hidden = !(state.speakers || []).length;
 
   const list = $("transcript");
   list.innerHTML = "";
@@ -135,16 +373,31 @@ function render(state) {
     const li = document.createElement("li");
     li.className = "block";
     li.style.setProperty("--spk", speakerColor(block.speaker));
-    const langs = (block.langs || []).join("/");
-    li.innerHTML = `<div class="who"><button type="button">${escapeHtml(block.name)}</button><span>${escapeHtml(formatWhen(block.start))} · ${escapeHtml(block.duration)} · ${escapeHtml(langs)}</span></div><div class="body">${escapeHtml(block.text)}</div>`;
+    const langs = (block.langs || []).filter((code) => code && code !== "und");
+    const langLabel = langs.length ? langs.join("/") : "—";
+    li.innerHTML = `<div class="who"><button type="button" title="Rename ${escapeHtml(block.name)}">${escapeHtml(block.name)}</button><span>${escapeHtml(formatWhen(block.start))} · ${escapeHtml(block.duration)} · ${escapeHtml(langLabel)}</span></div><div class="body">${escapeHtml(block.text)}</div>`;
     li.querySelector("button").addEventListener("click", () => renameSpeaker(block.speaker, block.name));
     list.appendChild(li);
   }
   $("tx-empty").hidden = (state.blocks || []).length > 0;
+  if (!$("tx-empty").hidden) {
+    if (state.transcribing || (pendingJob && pendingJob.kind === "transcribe")) {
+      $("tx-empty").innerHTML = "Speakers first, on the whole recording. Whisper writes each turn as it finishes.";
+    } else if (listening) {
+      $("tx-empty").innerHTML = `Recording ${formatClock(duration)}. Transcription starts when you stop.`;
+    } else if (hasRecording) {
+      $("tx-empty").innerHTML = "Recording saved. Transcription should already be running. Press <strong>Transcribe</strong> if it is not.";
+    } else {
+      $("tx-empty").innerHTML = "Choose StenoPod Speakers or Headphones, then press <strong>Start recording</strong>. Transcription starts when you stop.";
+    }
+  }
   $("notes").innerHTML = renderMarkdown(state.notes || "");
-  $("nt-empty").hidden = Boolean(state.notes) || Boolean(state.summary_error);
+  $("nt-empty").hidden = Boolean(state.notes) || Boolean(state.summary_error) || Boolean(state.transcribe_error);
   const err = $("nt-err");
-  if (state.summary_error) {
+  if (state.transcribe_error) {
+    err.hidden = false;
+    err.textContent = state.transcribe_error;
+  } else if (state.summary_error) {
     err.hidden = false;
     err.textContent = state.summary_error;
   } else {
@@ -177,20 +430,263 @@ function connectWs() {
   ws.onclose = () => setTimeout(connectWs, 1500);
 }
 
-$("btn-summarize").addEventListener("click", async () => {
-  $("btn-summarize").disabled = true;
+function syncCaptureButton(listening, running, busy, hasRecording) {
+  const btn = $("btn-capture");
+  if (!btn) return;
+  if (running && !listening && !busy) {
+    const wavSaved = Boolean(lastState && lastState.audio_path);
+    btn.disabled = !wavSaved;
+    btn.classList.toggle("stop", wavSaved);
+    btn.textContent = wavSaved ? "Stop recording" : "Starting…";
+    return;
+  }
+  if (!listening && hasRecording) {
+    btn.disabled = true;
+    btn.classList.remove("stop");
+    btn.textContent = "Start recording";
+    return;
+  }
+  btn.disabled = Boolean(busy);
+  btn.classList.toggle("stop", listening);
+  btn.textContent = listening ? "Stop recording" : "Start recording";
+}
+
+let boundsSession = null;
+
+function applySavedBounds(state) {
+  if (!state || state.id === boundsSession) return;
+  boundsSession = state.id;
+  if (!state.speaker_bounds_saved) return;
+  const minBox = $("spk-min");
+  const maxBox = $("spk-max");
+  if (document.activeElement === minBox || document.activeElement === maxBox) return;
+  minBox.value = state.min_speakers ? String(state.min_speakers) : "";
+  maxBox.value = state.max_speakers ? String(state.max_speakers) : "";
+}
+
+function boundsPhrase() {
+  const body = speakerBounds();
+  const min = body.min_speakers;
+  const max = body.max_speakers;
+  if (min && max && min === max) return `exactly ${min} speaker${min === 1 ? "" : "s"}`;
+  if (min || max) return `speakers from ${min || "auto"} to ${max || "auto"}`;
+  return "automatic speaker count";
+}
+
+function speakerBounds() {
+  const read = (id) => {
+    const raw = $(id).value.trim();
+    if (!raw) return null;
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 1 || n > 12) {
+      throw new Error("Speaker counts must be whole numbers from 1 to 12, or left blank.");
+    }
+    return n;
+  };
+  const min = read("spk-min");
+  const max = read("spk-max");
+  if (min !== null && max !== null && min > max) {
+    throw new Error("Minimum speakers cannot be higher than the maximum.");
+  }
+  const body = {};
+  if (min !== null) body.min_speakers = min;
+  if (max !== null) body.max_speakers = max;
   try {
-    const r = await fetch("/api/summarize", { method: "POST" });
-    render(await r.json());
-  } finally {
-    $("btn-summarize").disabled = false;
+    localStorage.setItem("stenopod.speakers", JSON.stringify({ min, max }));
+  } catch (err) {
+    /* storage can be blocked; the request still uses the fields */
+  }
+  return body;
+}
+
+function restoreSpeakerBounds() {
+  let saved = null;
+  try {
+    saved = JSON.parse(localStorage.getItem("stenopod.speakers") || "null");
+  } catch (err) {
+    saved = null;
+  }
+  if (!saved) return;
+  if (saved.min) $("spk-min").value = String(saved.min);
+  if (saved.max) $("spk-max").value = String(saved.max);
+}
+
+function apiError(body, fallback) {
+  const d = body && body.detail;
+  if (typeof d === "string") return d;
+  if (d) return JSON.stringify(d);
+  return fallback;
+}
+
+$("btn-capture").addEventListener("click", async () => {
+  const btn = $("btn-capture");
+  const listening = btn.classList.contains("stop");
+  btn.disabled = true;
+  try {
+    if (listening) {
+      btn.textContent = "Stopping…";
+      pendingJob = { kind: "transcribe", label: "Stopping recording. Transcription starts next.", progress: null };
+      if (lastState) render(lastState);
+      const r = await fetch("/api/capture/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(speakerBounds()),
+      });
+      const body = await r.json().catch(() => ({}));
+      pendingJob = null;
+      if (!r.ok) throw new Error(apiError(body, r.statusText));
+      if (body.state) render(body.state);
+      else fetchState();
+    } else {
+      btn.textContent = "Starting…";
+      const r = await fetch("/api/capture/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source: $("capture-source").value,
+        }),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(apiError(body, r.statusText));
+      if (body.state) render(body.state);
+    }
+  } catch (err) {
+    pendingJob = null;
+    alert(err.message || String(err));
+    fetchState().catch(() => {});
   }
 });
 
+async function deleteRecording(row) {
+  const title = row.title || "this recording";
+  if (!confirm(`Delete “${title}”? This removes the audio file and its transcript.`)) return;
+  try {
+    const r = await fetch("/api/recordings/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: row.path }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(apiError(body, r.statusText));
+    render(body);
+  } catch (err) {
+    alert(err.message || String(err));
+    fetchState();
+  }
+}
+
+async function postRecording(action, row) {
+  if (action === "again") {
+    const title = row.title || "this recording";
+    let phrase = "the speaker counts in the header";
+    try {
+      phrase = boundsPhrase();
+    } catch (err) {
+      alert(err.message || String(err));
+      return;
+    }
+    if (!confirm(`Transcribe “${title}” again? This redoes the speakers (${phrase}), the transcript, and the notes.`)) return;
+  }
+  if (action !== "open") {
+    pendingJob = { kind: "transcribe", label: "Starting transcription", progress: null };
+    if (lastState) render(lastState);
+  }
+  const path = action === "open" ? "/api/recordings/open" : "/api/recordings/transcribe";
+  try {
+    const r = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        path: row.path,
+        restart: action === "again",
+        ...(action === "open" ? {} : speakerBounds()),
+      }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(apiError(body, r.statusText));
+    pendingJob = null;
+    render(body);
+  } catch (err) {
+    pendingJob = null;
+    alert(err.message || String(err));
+    fetchState();
+  }
+}
+
+$("rec-toggle").addEventListener("click", () => {
+  const panel = $("rec-panel");
+  const open = panel.hidden;
+  panel.hidden = !open;
+  $("rec-toggle").setAttribute("aria-expanded", open ? "true" : "false");
+  $("rec-toggle").querySelector(".rec-chevron").textContent = open ? "▾" : "▸";
+});
+
+$("recordings").addEventListener("click", (ev) => {
+  const btn = ev.target.closest("button");
+  if (!btn || btn.disabled) return;
+  const row = (lastState && lastState.recordings ? lastState.recordings : [])[Number(btn.dataset.index)];
+  if (!row) return;
+  if (btn.dataset.action === "delete") {
+    deleteRecording(row);
+    return;
+  }
+  postRecording(btn.dataset.action, row);
+});
+
+$("btn-transcribe").addEventListener("click", async () => {
+  pendingJob = { kind: "transcribe", label: "Starting transcription", progress: null };
+  if (lastState) render(lastState);
+  try {
+    const r = await fetch("/api/transcribe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(speakerBounds()),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(apiError(body, r.statusText));
+    pendingJob = null;
+    render(body);
+  } catch (err) {
+    pendingJob = null;
+    alert(err.message || String(err));
+    fetchState();
+  }
+});
+
+const downloadBtn = $("btn-download");
+const downloadPanel = $("download-panel");
+if (downloadBtn && downloadPanel) {
+  downloadBtn.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    const open = downloadPanel.hidden;
+    downloadPanel.hidden = !open;
+    downloadBtn.setAttribute("aria-expanded", open ? "true" : "false");
+  });
+  document.addEventListener("click", (ev) => {
+    if (ev.target.closest("#download-menu")) return;
+    downloadPanel.hidden = true;
+    downloadBtn.setAttribute("aria-expanded", "false");
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Escape") return;
+    downloadPanel.hidden = true;
+    downloadBtn.setAttribute("aria-expanded", "false");
+  });
+}
+
 $("btn-new").addEventListener("click", async () => {
-  if (!confirm("Start a new session? Current notes stay on disk.")) return;
+  if (!confirm("Start a new meeting? This recording stays on disk.")) return;
   const r = await fetch("/api/session", { method: "POST" });
-  render(await r.json());
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    alert(apiError(body, r.statusText));
+    return;
+  }
+  render(body);
+});
+
+$("capture-source").addEventListener("change", () => {
+  if (lastState) render(lastState);
 });
 
 let titleTimer;
@@ -205,6 +701,7 @@ $("title").addEventListener("input", () => {
   }, 400);
 });
 
+restoreSpeakerBounds();
 fetchState();
 fetchHealth();
 setInterval(fetchHealth, 8000);

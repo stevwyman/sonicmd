@@ -1,44 +1,61 @@
-.PHONY: help models devices up down logs sidecar sidecar-meet sidecar-venv capture-test app-dev
+.PHONY: help models devices up down logs status sidecar sidecar-meet sidecar-venv app-venv capture-test
+
+# Extra sidecar flags, e.g.
+#   make sidecar-meet MIC_DEVICE='MacBook Air-Mikrofon'
+#   make sidecar ARGS='--source both --mic-device "MacBook Air-Mikrofon"'
+ARGS ?=
+MIC_DEVICE ?=
+mic_flag = $(if $(MIC_DEVICE),--mic-device "$(MIC_DEVICE)")
 
 help:
-	@echo "StenoPod"
-	@echo "  make models        Download the Qwen 3B GGUF into ./models"
-	@echo "  make up            Build and start app + llama.cpp (Podman)"
-	@echo "  make down          Stop the stack"
-	@echo "  make logs          Follow container logs"
+	@echo "StenoPod (native macOS, local MLX notes)"
+	@echo "  make models        Download Whisper, pyannote 3.1, and Qwen MLX (once, online)"
+	@echo "  make app-venv      Create app venv (FastAPI)"
+	@echo "  make sidecar-venv  Create host venv (Whisper + pyannote.audio + MLX notes)"
+	@echo "  make up            Start the web app"
+	@echo "  make down          Stop the app (and capture if the UI started it)"
+	@echo "  make logs          Follow app + sidecar logs"
+	@echo "  make status        Show app / sidecar"
 	@echo "  make devices       List macOS audio capture devices"
-	@echo "  make sidecar-venv  Create host venv (Whisper + pyannote.audio)"
 	@echo "  make capture-test  Record 3s from BlackHole and check for real audio"
-	@echo "  make sidecar       Capture system audio (BlackHole) + transcribe"
-	@echo "  make sidecar-meet  Mix BlackHole + microphone (Webex / Meet)"
-	@echo "  make app-dev       Run the web app on the host (no Podman)"
+	@echo "  make sidecar       Capture system audio (BlackHole) from the terminal"
+	@echo "  make sidecar-meet  Mix BlackHole + microphone (or use Start capture in the UI)"
+	@echo "  Extra sidecar flags: make sidecar-meet MIC_DEVICE='MacBook Air-Mikrofon'"
 
 models:
 	./scripts/download-llm.sh
 
-capture-test:
-	./scripts/capture-test.sh
-
-up:
-	podman compose up --build -d
-
-down:
-	podman compose down
-
-logs:
-	podman compose logs -f
+app-venv:
+	python3 -m venv .venv-app
+	.venv-app/bin/pip install -U pip
+	.venv-app/bin/pip install -r app/requirements.txt
 
 sidecar-venv:
 	python3 -m venv .venv-host
 	.venv-host/bin/pip install -U pip
 	.venv-host/bin/pip install -r host/requirements.txt
 
+capture-test:
+	./scripts/capture-test.sh
+
+up:
+	@if [ ! -x .venv-app/bin/python ]; then $(MAKE) app-venv; fi
+	./scripts/stack.sh start
+
+down:
+	./scripts/stack.sh stop
+
+logs:
+	./scripts/stack.sh logs
+
+status:
+	./scripts/stack.sh status
+
+devices:
+	./.venv-host/bin/python host/sidecar.py --list-devices
+
 sidecar:
-	./.venv-host/bin/python host/sidecar.py
+	./.venv-host/bin/python host/sidecar.py $(ARGS) $(mic_flag)
 
 sidecar-meet:
-	./.venv-host/bin/python host/sidecar.py --source both
-
-app-dev:
-	DATA_DIR="$(PWD)/data" LLM_URL="$${LLM_URL:-http://127.0.0.1:8081}" \
-		./.venv-app/bin/python -m uvicorn stenopod.main:app --app-dir app --reload --host 127.0.0.1 --port 8780
+	./.venv-host/bin/python host/sidecar.py --source both $(ARGS) $(mic_flag)

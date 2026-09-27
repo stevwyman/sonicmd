@@ -1,35 +1,33 @@
 # sonicmd
 
-StenoPod captures whatever is playing on your Mac, transcribes it locally with **Metal Whisper**, and folds the rolling transcript into **markdown notes** with a small LLM running in **Podman (LibKrun / Vulkan)**.
+StenoPod captures whatever is playing on your Mac, transcribes it locally with **Metal Whisper**, and folds the rolling transcript into **markdown notes** with a local **MLX Qwen** process on this Mac. No Podman, no Ollama, no extra llama-server.
 
 There is no hook into Zoom, Teams, or the browser. The sidecar listens to a virtual audio device (and optionally a file). English and German are both handled by multilingual Whisper; notes follow the dominant language of the speech.
 
 ```
 Mac speakers / headphones ─┐
-Apps  →  Multi-Output  ────┼─► BlackHole 2ch ─► host sidecar (mlx-whisper, Metal)
+Apps  →  Multi-Output  ────┼─► BlackHole 2ch ─► sidecar (mlx-whisper, Metal)
 Mic  ──────────────────────┘                         │
                                                      ▼ JSON segments
-                                            stenopod-app :8780
+                                            FastAPI UI :8780
                                                      │
-                                            stenopod-llm :8081
-                                            llama.cpp Vulkan via /dev/dri
+                                            MLX Qwen (local process, no server)
 ```
 
 ## What runs where
 
 | Piece | Where | Why |
 |---|---|---|
-| BlackHole + ffmpeg | macOS | Containers cannot see Core Audio |
+| BlackHole + ffmpeg | macOS | Core Audio is host-only |
 | Whisper `large-v3-turbo` | macOS Metal (`mlx-whisper`) | Live EN/DE captions |
-| Web UI + session store | Podman `stenopod-app` | Transcript + notes at http://127.0.0.1:8780 |
-| Qwen2.5-3B Instruct Q4 | Podman `stenopod-llm` | Markdown summaries on the LibKrun GPU |
+| Web UI + session store | `make up` → FastAPI on :8780 | Transcript + notes + Start/Stop |
+| Qwen2.5 7B Instruct, MLX 4-bit | `mlx-lm` in the host venv | Markdown summaries |
 
-On a 16 GB M1, keep the Podman machine at **8 GB**. Whisper stays on the host so the VM is free for the 3B notes model.
+On a 16 GB Mac, Whisper, pyannote, and Qwen share unified memory. Notes load after transcription finishes. Keep other heavy apps closed while capturing.
 
 ## Prerequisites
 
 - Apple Silicon Mac
-- [Podman Desktop](https://podman-desktop.io/) with **LibKrun** / Default GPU (you already have this)
 - [Homebrew](https://brew.sh)
 - Python 3.11+
 
@@ -40,24 +38,50 @@ brew install --cask blackhole-2ch
 
 ### Route system audio into BlackHole
 
-1. Open **Audio MIDI Setup**.
-2. Click **+** → **Create Multi-Output Device**.
-3. Enable your speakers/headphones **and** **BlackHole 2ch**.
-4. Enable **Drift Correction** on BlackHole.
-5. Set that multi-output as the Mac’s sound output so you still hear audio while StenoPod records a copy.
+A Multi-Output Device plays to **every box you tick, at the same time**. If Mac speakers and BlackHole are both ticked, the speakers stay on even after you connect Bluetooth headphones. Connecting headphones does not change that list.
 
-List capture devices any time with `make devices`. The sidecar picks BlackHole automatically if it is present.
+Make **two** Multi-Outputs and switch between them. Do not put speakers and headphones in the same one.
+
+1. Connect the Bluetooth headphones first. Open **Audio MIDI Setup** (`/Applications/Utilities/Audio MIDI Setup.app`).
+2. Select **BlackHole 2ch**, **MacBook speakers**, and the headphones. Set each to **48 000 Hz**, 2 channels.
+3. **+** → **Create Multi-Output Device**. Rename it `StenoPod Speakers`. Tick **only** MacBook speakers + **BlackHole 2ch**. Enable **Drift Correction** on BlackHole.
+4. **+** → **Create Multi-Output Device** again. Rename it `StenoPod Headphones`. Tick **only** the Bluetooth headphones + **BlackHole 2ch**. Drift Correction on BlackHole again.
+5. In **System Settings → Sound** (not in Meet — Meet’s “system audio” follows this):
+   - **Output** = `StenoPod Headphones` or `StenoPod Speakers`
+   - **Input** = **MacBook Air-Mikrofon** (not AirPods)
+6. Never pick the headphones or speakers as Output by themselves — then BlackHole gets silence and StenoPod records nothing.
+
+That two-device layout is correct: you only switch where **you** hear audio; BlackHole is ticked on both, so the sidecar should always get a copy. The sidecar still records **BlackHole**, not the Multi-Output name. If you hear Meet in the buds but BlackHole levels stay ~0, the Multi-Output is not actually copying (common with AirPods). Restart Chrome/Meet after switching Output, confirm 48 kHz and Drift Correction on BlackHole, and that BlackHole is not muted in Audio MIDI Setup when `StenoPod Headphones` is selected.
+
+`make sidecar` records **only BlackHole** (YouTube, Meet remote audio). It does **not** record your headphone mic. Your voice needs `make sidecar-meet`.
+
+**AirPods cannot be the listen device and the talk device at the same time.** If Input is AirPods, macOS switches them to Hands-Free: the Multi-Output copy into BlackHole goes silent, which is why the sidecar hears nothing. Keep Input on the MacBook mic.
+
+To switch output: change the Sound **Output** picker. Leave the sidecar running.
+
+Bluetooth in a Multi-Output can glitch (dropouts, device missing until you reconnect). If the headphones do not appear as a tick box, disconnect/reconnect them, or use a wired jack. Sample rate mismatches (44.1 vs 48 kHz) are the usual cause of crackle.
+
+List capture devices with `make devices`. The sidecar picks BlackHole automatically if it is present.
 
 ### Meetings (Webex / Google Meet): add your microphone
 
-Remote people arrive through the speakers → BlackHole. Your own voice only arrives if we also capture the mic.
+Remote people arrive through the Multi-Output → BlackHole. Your own voice only arrives if we also capture a mic.
 
 ```bash
-make sidecar-meet
-# same as: ./.venv-host/bin/python host/sidecar.py --source both
+make sidecar-meet MIC_DEVICE='MacBook Air-Mikrofon'
+# same as:
+./.venv-host/bin/python host/sidecar.py --source both --mic-device "MacBook Air-Mikrofon"
 ```
 
-Use **headphones** so the mic does not re-record the other side. pyannote still splits speakers (you vs them) as A/B — rename your chip after the first turns.
+There is no `sidecar` binary. `make sidecar --source both` also does not work (Make eats the flags). `--source both` mixes BlackHole + mic into **one** stream, then pyannote splits speakers. It is not two labeled “Me” / “them” streams.
+
+Prefer the **MacBook microphone** while you *listen* on Bluetooth. Do not set Sound → Input to AirPods.
+
+If you select the headphone mic as the Mac’s input, macOS switches the headset to Hands-Free: playback gets thin and BlackHole usually goes silent. Keep **Input** on the MacBook mic, **Output** on `StenoPod Headphones`.
+
+There is no reliable way to use the AirPods mic with this stack. `make devices` may show `AirPods Pro - Find My`; that is not a microphone — ignore it.
+
+Use headphones so the Mac mic does not re-record the other side. pyannote splits you vs them as A/B — rename the chip after the first turns.
 
 If Meet/Webex has exclusive lock on the microphone, ffmpeg will fail to open it. Quit extra capture processes, or in Audio MIDI Setup create an **Aggregate Device** of BlackHole + your mic and run:
 
@@ -65,38 +89,39 @@ If Meet/Webex has exclusive lock on the microphone, ffmpeg will fail to open it.
 ./.venv-host/bin/python host/sidecar.py --source system --device "StenoPod In"
 ```
 
-Pick the mic explicitly with `--mic-device "MacBook Air-Mikrofon"` if `make devices` shows several.
-
 ## Run
 
 ```bash
-# 1. Notes model (~2 GB, once)
+# 1. Python envs (once)
+make app-venv
+make sidecar-venv
+cp .env.example .env            # then put your Hugging Face token in .env
+
+# 2. Download models once, while online (Whisper, pyannote 3.1, segmentation-3.0, Qwen MLX)
 make models
 
-# 2. App + llama.cpp in Podman (needs the LibKrun machine running)
+# 3. Web UI. Later runs stay offline (HF_HUB_OFFLINE=1).
 make up
-
-# 3. Metal Whisper + pyannote sidecar on the Mac
-cp .env.example .env            # then put your Hugging Face token in .env
-make sidecar-venv
-make sidecar
 ```
 
-Open [http://127.0.0.1:8780](http://127.0.0.1:8780).
+Open [http://127.0.0.1:8780](http://127.0.0.1:8780). Press **New meeting**, choose where you are listening, then **Start recording**.
 
-Play anything through the multi-output. **pyannote.audio** (local `community-1` pipeline) cuts speaker turns; labels stay **Speaker A, B, C…** across windows. Click a chip to rename. Notes update after a pause, after enough new text, or when you click **Update notes**.
+- **StenoPod Speakers** records system audio only. Set Sound → Output to `StenoPod Speakers`.
+- **StenoPod Headphones** records system audio plus the Mac microphone. Set Sound → Output to `StenoPod Headphones`, and Input to the Mac microphone.
 
-`Ctrl+C` on the sidecar stops capture, transcribes whatever is still in the buffer, then exits. Press `Ctrl+C` again if you need to abort immediately.
+While recording, Transcribe stays off. **Stop recording** closes the wav under `.run/captures/` and starts transcription on its own: pyannote labels speakers on the whole recording, Whisper writes each turn with its language, then notes are written. Min and Max next to the source choose the speaker count (leave them blank for automatic, or set them equal for an exact count). Those values are saved with the meeting and used again by **Transcribe again**. The **Recordings** list opens any saved wav and can rerun speakers, transcript, and notes. **Download** saves the transcript or the notes. Rename a speaker to store that voice; a later meeting can reuse the name.
 
-Capture stays on the main thread; pyannote and Whisper run on a worker so ffmpeg is not paused during inference. Each window logs `timing … pyannote Xs / whisper Ys`. If inference falls more than four windows behind live audio, the oldest queued window is dropped.
+You can still start capture from a terminal with `make sidecar` or `make sidecar-meet` if you want the logs in that window. The web app is the path that transcribes after stop.
 
-### Hugging Face token (required for pyannote)
+`Ctrl+C` / **Stop recording** closes the wav. Retry a saved wav with `./.venv-host/bin/python host/sidecar.py --file .run/captures/stenopod-….wav`.
 
-1. Accept the model terms: <https://huggingface.co/pyannote/speaker-diarization-community-1>
+### Hugging Face token (required for speakers)
+
+1. Accept the model terms: <https://huggingface.co/pyannote/speaker-diarization-3.1> and <https://huggingface.co/pyannote/segmentation-3.0>
 2. Create a read token: <https://huggingface.co/settings/tokens>
-3. Copy `.env.example` to `.env` and set `HF_TOKEN=hf_...`. That file is gitignored. `make sidecar` and `host/sidecar.py` load it automatically. A shell `export` still wins if you already set one.
+3. Copy `.env.example` to `.env` and set `HF_TOKEN=hf_...`. That file is gitignored. **Start recording**, `make sidecar`, and `host/sidecar.py` load it automatically.
 
-Without a token, use the lighter embedder instead: `./.venv-host/bin/python host/sidecar.py --diarize ecapa`
+Without a token, Transcribe cannot run. Speaker labels come from pyannote on the whole recording.
 
 Transcribe a file instead of live audio:
 
@@ -114,40 +139,41 @@ Stop the stack with `make down`. Logs: `make logs`.
 | `host/sidecar.py --model` | `mlx-community/whisper-large-v3-turbo` | MLX Whisper repo |
 | `host/sidecar.py --source` | `system` | `system` (BlackHole), `mic`, or `both` (meetings) |
 | `--mic-device` | built-in mic | Microphone name or index |
-| `LLM_URL` | `http://llm:8080` | llama.cpp server inside compose |
-| `AUTO_SUMMARY_CHARS` | `1800` | Fold notes when this much new text lands |
-| `AUTO_SUMMARY_SECONDS` | `90` | Fold notes after this much quiet |
-| `--diarize` | `pyannote` | `pyannote` (local) or `ecapa` |
-| `--num-speakers` | unset | Optional hint for pyannote |
-| `--min-seconds` / `--max-seconds` | `6` / `18` | Live window size for pyannote |
+| `HF_HUB_OFFLINE` | `1` | Inference uses the local cache only. `make models` is the online step. |
+| `LLM_MODEL` | `mlx-community/Qwen2.5-7B-Instruct-4bit` | Local MLX notes model |
+| `AUTO_SUMMARY_CHARS` | unused | Notes run after transcription finishes |
+| `AUTO_SUMMARY_SECONDS` | unused | Notes are not written on a timer |
+| `--chunk-seconds` | unused | Speakers are not sliced. Whisper still windows a long turn at 30s. |
+| `--diarize` | `pyannote` | pyannote on the whole wav. `vad` / `ecapa` are legacy embedders. |
+| `--min-speakers` / `--max-speakers` | none | Header Min/Max. Equal values are an exact count. The transcript will not exceed Max. |
 
-Swap the GGUF in `compose.yaml` if you later try Qwen2.5-7B Q4. That is tighter on an 8 GB VM.
+`Qwen/Qwen2.5-7B-Instruct-MLX` is the name in the Qwen docs, and that repo is gone. The default is the MLX 4-bit conversion of the same instruct model.
 
 ## Troubleshooting
 
-**Sidecar lamp stays dark.** The app is up but `make sidecar` is not running, or it cannot reach `http://127.0.0.1:8780`.
+**Sidecar lamp stays dark.** Press **Start recording**, or run `make sidecar`. The app must be up at http://127.0.0.1:8780. Model download happens when you press **Transcribe**, and the first run can take a few minutes.
 
-**No speech in the transcript.** System output is not the multi-output device, or ffmpeg is capturing the wrong index (`make devices`, then `--device 1`). Raise `--vad` if fan noise triggers junk, lower it if quiet speech is dropped.
+**No speech in the transcript.** System output is not the multi-output device, or ffmpeg is capturing the wrong index (`make devices`, then `--device 1`). Capture can be running with a silent BlackHole — check the sidecar log for levels. Stop recording (transcription starts on its own), or press **Transcribe** on that row.
 
-**LLM lamp is red.** The GGUF is missing (`make models`) or `llama-server` failed to start. Check `podman logs stenopod-llm`. Confirm the machine is LibKrun and the container has `/dev/dri`.
+**LLM lamp is red.** The Qwen weights are not in the Hugging Face cache. Run `make models` once while online.
 
-**GPU not used.** Inside the VM this is Vulkan forwarded to Metal, not native Metal. `llama.cpp` must run with `-ngl 99`. CPU fallback will still summarize, just slowly.
+**Too many speakers / hopping A/B mid-sentence.** Set Min and Max before **Transcribe again**. An exact count is Min and Max set to the same number. pyannote labels the whole wav once, Whisper writes each turn, and the transcript is kept inside that maximum.
 
-**Everything is Speaker A.** The sidecar now keeps pyannote’s per-voice embeddings across windows (ads vs host, you vs them). Restart `make sidecar` after updating. English vs German is a hint, not a hard split — a bilingual speaker can stay one label if the voice match is strong. Rename chips when you know who is who.
+**Overlapping speech.** Speakers come from `pyannote/segmentation-3.0` with the `speaker-diarization-3.1` clustering settings, on MPS when available. Overlap and heavy compression still confuse labels.
 
-**Overlapping speech.** pyannote.audio segments turns locally (`community-1` on MPS when available). Overlap and heavy compression still confuse labels.
+**HF token errors.** Accept the 3.1 and segmentation-3.0 terms, put `HF_TOKEN` in `.env`, and run `make models`. Transcription does not download models.
 
-**HF token errors.** Accept the community-1 terms and put `HF_TOKEN` in `.env`. First sidecar start downloads the pipeline.
-
-**Out of memory.** pyannote (PyTorch) and Whisper both sit on the Mac. If the machine swaps, shrink the Podman VM while capturing, or use `--diarize ecapa`.
+**Out of memory.** pyannote (PyTorch), Whisper, and the MLX notes model all sit on the Mac. Notes start after Whisper has exited. If the machine swaps, close other apps.
 
 ## Layout
 
 ```
 app/           FastAPI UI + incremental notes
-host/sidecar.py  AVFoundation capture + mlx-whisper + pyannote.audio
-models/        GGUF (gitignored)
+host/sidecar.py  AVFoundation capture (wav) + control API :8781
+host/chunk_transcribe.py  pyannote on the full wav, then Whisper per turn
 data/          session JSON
 .env           local secrets (`HF_TOKEN`; gitignored)
-compose.yaml   app + ramalama llama.cpp (Vulkan)
+.run/          native process logs, pid files, and capture wavs
+scripts/stack.sh  start/stop the web app
+host/notes_llm.py  local MLX Qwen notes (no Ollama)
 ```
