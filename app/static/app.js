@@ -109,7 +109,8 @@ function formatClock(s) {
 }
 
 const ROUTES = {
-  both: "StenoPod Headphones · system + mic. Set Sound → Output to StenoPod Headphones, and Input to the Mac microphone.",
+  both: "Headphones: Output StenoPod Headphones, Input MacBook mic. Wav is stereo — left=you, right=them.",
+  speakers: "Speakers: Output StenoPod Speakers, Input MacBook mic. Wav is stereo — left=you, right=them. Echo from the speakers is cancelled on the left.",
   system: "StenoPod Speakers · system audio only. Set Sound → Output to StenoPod Speakers.",
 };
 
@@ -118,6 +119,8 @@ let renamingId = null;
 let renameDraft = "";
 let pendingJob = null;
 let pollTimer = null;
+let recordStartedAt = null;
+let recordTick = null;
 
 function formatDay(iso) {
   try {
@@ -130,6 +133,31 @@ function formatDay(iso) {
 function activeJob(state, serverBusy) {
   if (serverBusy && state.job && state.job.label) return state.job;
   return pendingJob;
+}
+
+function ensureRecordTick(listening) {
+  if (listening) {
+    if (recordStartedAt == null) recordStartedAt = Date.now();
+    if (!recordTick) {
+      recordTick = setInterval(() => {
+        if (lastState) render(lastState);
+      }, 250);
+    }
+    return;
+  }
+  recordStartedAt = null;
+  if (recordTick) {
+    clearInterval(recordTick);
+    recordTick = null;
+  }
+}
+
+function recordingClock(state, listening) {
+  const reported = Number(listening ? state.sidecar && state.sidecar.recorded_s : state.audio_duration_s) || 0;
+  if (listening && recordStartedAt != null) {
+    return Math.max(reported, (Date.now() - recordStartedAt) / 1000);
+  }
+  return reported;
 }
 
 function ensurePoll(busy) {
@@ -303,11 +331,12 @@ function render(state) {
   }
   lastState = state;
   const listening = Boolean(state.sidecar && state.sidecar.listening);
+  ensureRecordTick(listening);
   const serverBusy = Boolean(state.transcribing || state.summarizing || (state.job && state.job.kind));
   const job = activeJob(state, serverBusy);
   const busy = serverBusy || Boolean(pendingJob);
-  const duration = listening ? state.sidecar.recorded_s : state.audio_duration_s;
-  const hasRecording = !listening && (Number(duration) > 1 || Boolean(state.audio_path));
+  const duration = recordingClock(state, listening);
+  const hasRecording = !listening && Number(duration) > 1;
   const transcribed =
     hasRecording && Number(state.audio_cursor_s) >= Number(duration) - 1 && (state.segment_count || 0) > 0;
   const sel = $("capture-source");
@@ -433,22 +462,27 @@ function connectWs() {
 function syncCaptureButton(listening, running, busy, hasRecording) {
   const btn = $("btn-capture");
   if (!btn) return;
-  if (running && !listening && !busy) {
-    const wavSaved = Boolean(lastState && lastState.audio_path);
-    btn.disabled = !wavSaved;
-    btn.classList.toggle("stop", wavSaved);
-    btn.textContent = wavSaved ? "Stop recording" : "Starting…";
+  if (listening) {
+    btn.disabled = Boolean(busy);
+    btn.classList.add("stop");
+    btn.textContent = "Stop recording";
     return;
   }
-  if (!listening && hasRecording) {
+  if (running && !busy) {
+    btn.disabled = true;
+    btn.classList.remove("stop");
+    btn.textContent = "Starting…";
+    return;
+  }
+  if (hasRecording) {
     btn.disabled = true;
     btn.classList.remove("stop");
     btn.textContent = "Start recording";
     return;
   }
   btn.disabled = Boolean(busy);
-  btn.classList.toggle("stop", listening);
-  btn.textContent = listening ? "Stop recording" : "Start recording";
+  btn.classList.remove("stop");
+  btn.textContent = "Start recording";
 }
 
 let boundsSession = null;
@@ -539,14 +573,28 @@ $("btn-capture").addEventListener("click", async () => {
       else fetchState();
     } else {
       btn.textContent = "Starting…";
-      const r = await fetch("/api/capture/start", {
+      const startBody = JSON.stringify({
+        source: $("capture-source").value,
+      });
+      let r = await fetch("/api/capture/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          source: $("capture-source").value,
-        }),
+        body: startBody,
       });
-      const body = await r.json().catch(() => ({}));
+      let body = await r.json().catch(() => ({}));
+      if (r.status === 409 && /already running/i.test(apiError(body, ""))) {
+        await fetch("/api/capture/stop", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(speakerBounds()),
+        });
+        r = await fetch("/api/capture/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: startBody,
+        });
+        body = await r.json().catch(() => ({}));
+      }
       if (!r.ok) throw new Error(apiError(body, r.statusText));
       if (body.state) render(body.state);
     }

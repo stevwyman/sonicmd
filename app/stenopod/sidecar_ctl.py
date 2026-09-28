@@ -15,7 +15,6 @@ RUN_DIR = REPO_ROOT / ".run"
 PID_FILE = RUN_DIR / "sidecar.pid"
 LOG_FILE = RUN_DIR / "sidecar.log"
 CONTROL_URL = os.environ.get("STENOPOD_CONTROL", "http://127.0.0.1:8781")
-CHUNK_S = 55.0
 
 
 def wav_duration_s(path: str | Path) -> float:
@@ -157,26 +156,6 @@ def wait_control(timeout: float = 20.0) -> dict[str, Any]:
     return last
 
 
-def rotate(session_id: str) -> dict[str, Any]:
-    return _ctl("POST", "/rotate", {"session_id": session_id}, timeout=8.0)
-
-
-def open_wav(session_id: str, wav: str | None = None) -> dict[str, Any]:
-    body: dict[str, Any] = {"session_id": session_id}
-    if wav:
-        body["wav"] = wav
-    return _ctl("POST", "/open", body, timeout=8.0)
-
-
-def process(start_s: float, end_s: float, chunk_s: float = CHUNK_S) -> dict[str, Any]:
-    return _ctl(
-        "POST",
-        "/process",
-        {"start_s": start_s, "end_s": end_s, "chunk_s": chunk_s},
-        timeout=3600.0,
-    )
-
-
 def _transcribe_failure(code: int) -> str:
     text = LOG_FILE.read_text(errors="replace") if LOG_FILE.exists() else ""
     lines = text.splitlines()
@@ -195,7 +174,6 @@ def process_file(
     start_s: float,
     end_s: float,
     app_url: str,
-    chunk_s: float = CHUNK_S,
     min_speakers: int | None = None,
     max_speakers: int | None = None,
 ) -> dict[str, Any]:
@@ -213,10 +191,6 @@ def process_file(
         str(start_s),
         "--end-s",
         str(end_s),
-        "--chunk-seconds",
-        str(chunk_s),
-        "--diarize",
-        "pyannote",
     ]
     if min_speakers and max_speakers and min_speakers == max_speakers:
         cmd.extend(["--num-speakers", str(min_speakers)])
@@ -237,7 +211,6 @@ def start(
     source: str = "both",
     mic_device: str | None = None,
     app_url: str = "http://127.0.0.1:8780",
-    diarize: str = "pyannote",
     session_id: str | None = None,
     wav: str | None = None,
 ) -> dict[str, Any]:
@@ -250,10 +223,6 @@ def start(
     if existing:
         return {"ok": True, "already": True, "pid": existing}
 
-    mode = (diarize or "pyannote").strip().lower()
-    if mode not in {"pyannote", "vad", "ecapa"}:
-        mode = "pyannote"
-
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     cmd = [
         str(py),
@@ -262,10 +231,6 @@ def start(
         app_url,
         "--source",
         source,
-        "--diarize",
-        mode,
-        "--chunk-seconds",
-        str(CHUNK_S),
     ]
     if mic_device:
         cmd.extend(["--mic-device", mic_device])
@@ -316,14 +281,11 @@ def stop(include_file: bool = False) -> dict[str, Any]:
             pids.discard(pid)
             continue
         try:
-            os.killpg(pid, signal.SIGINT)
+            os.kill(pid, signal.SIGINT)
         except OSError:
-            try:
-                os.kill(pid, signal.SIGINT)
-            except OSError:
-                continue
-    # Recording only writes a wav. It should exit as soon as ffmpeg closes.
-    deadline = time.time() + 8
+            continue
+    # Recording only writes a wav. The sidecar closes it after ffmpeg exits.
+    deadline = time.time() + 12
     while time.time() < deadline and any(_pid_alive(pid) for pid in pids):
         time.sleep(0.2)
     for pid in pids:

@@ -17,13 +17,14 @@ help:
 	@echo "  make logs          Follow app + sidecar logs"
 	@echo "  make status        Show app / sidecar"
 	@echo "  make devices       List macOS audio capture devices"
-	@echo "  make capture-test  Record 3s from BlackHole and check for real audio"
+	@echo "  make capture-test  Record 3s from BlackHole, then 3s from the Mac mic (speak during the mic part)"
 	@echo "  make sidecar       Capture system audio (BlackHole) from the terminal"
 	@echo "  make sidecar-meet  Mix BlackHole + microphone (or use Start capture in the UI)"
 	@echo "  Extra sidecar flags: make sidecar-meet MIC_DEVICE='MacBook Air-Mikrofon'"
 
 models:
-	./scripts/download-llm.sh
+	@if [ ! -x .venv-host/bin/python ]; then $(MAKE) sidecar-venv; fi
+	.venv-host/bin/python scripts/download-models.py
 
 app-venv:
 	python3 -m venv .venv-app

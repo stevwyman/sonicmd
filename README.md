@@ -19,7 +19,7 @@ Mic  ──────────────────────┘      
 | Piece | Where | Why |
 |---|---|---|
 | BlackHole + ffmpeg | macOS | Core Audio is host-only |
-| Whisper `large-v3-turbo` | macOS Metal (`mlx-whisper`) | Live EN/DE captions |
+| Whisper `large-v3-turbo` | macOS Metal (`mlx-whisper`) | Transcript after recording stops |
 | Web UI + session store | `make up` → FastAPI on :8780 | Transcript + notes + Start/Stop |
 | Qwen2.5 7B Instruct, MLX 4-bit | `mlx-lm` in the host venv | Markdown summaries |
 
@@ -141,10 +141,6 @@ Stop the stack with `make down`. Logs: `make logs`.
 | `--mic-device` | built-in mic | Microphone name or index |
 | `HF_HUB_OFFLINE` | `1` | Inference uses the local cache only. `make models` is the online step. |
 | `LLM_MODEL` | `mlx-community/Qwen2.5-7B-Instruct-4bit` | Local MLX notes model |
-| `AUTO_SUMMARY_CHARS` | unused | Notes run after transcription finishes |
-| `AUTO_SUMMARY_SECONDS` | unused | Notes are not written on a timer |
-| `--chunk-seconds` | unused | Speakers are not sliced. Whisper still windows a long turn at 30s. |
-| `--diarize` | `pyannote` | pyannote on the whole wav. `vad` / `ecapa` are legacy embedders. |
 | `--min-speakers` / `--max-speakers` | none | Header Min/Max. Equal values are an exact count. The transcript will not exceed Max. |
 
 `Qwen/Qwen2.5-7B-Instruct-MLX` is the name in the Qwen docs, and that repo is gone. The default is the MLX 4-bit conversion of the same instruct model.
@@ -168,12 +164,16 @@ Stop the stack with `make down`. Logs: `make logs`.
 ## Layout
 
 ```
-app/           FastAPI UI + incremental notes
-host/sidecar.py  AVFoundation capture (wav) + control API :8781
-host/chunk_transcribe.py  pyannote on the full wav, then Whisper per turn
-data/          session JSON
-.env           local secrets (`HF_TOKEN`; gitignored)
-.run/          native process logs, pid files, and capture wavs
-scripts/stack.sh  start/stop the web app
-host/notes_llm.py  local MLX Qwen notes (no Ollama)
+app/                    FastAPI UI, session store, notes
+app/static/             Web UI
+host/sidecar.py         AVFoundation capture (wav) + control API :8781
+host/chunk_transcribe.py  pyannote on the full wav, then Whisper
+host/pyannote_diarize.py  Speaker diarization
+host/notes_llm.py       Local MLX Qwen notes
+host/hf_offline.py      Cached Hugging Face models
+scripts/stack.sh        Start/stop the web app
+scripts/download-models.py  One-time model download
+data/                   Session JSON (gitignored except .gitkeep)
+.env                    Local secrets (`HF_TOKEN`; gitignored)
+.run/                   Logs, pid files, and capture wavs
 ```

@@ -70,7 +70,6 @@ suppress_listening = False
 _finish_task: asyncio.Task | None = None
 _rerun_backup: dict[str, dict[str, Any]] = {}
 _duration_cache: dict[str, tuple[int, int, float]] = {}
-CHUNK_S = 55.0
 STAGE_NAMES = {
     "pyannote": "Speakers",
     "whisper": "Whisper",
@@ -181,22 +180,13 @@ class RecordingBody(SpeakerBounds):
 class CaptureStartBody(BaseModel):
     source: str = "both"
     mic_device: str | None = None
-    diarize: str = "pyannote"
 
     @field_validator("source")
     @classmethod
     def capture_source(cls, value: str) -> str:
         key = (value or "both").strip().lower()
-        if key not in {"system", "mic", "both"}:
-            raise ValueError("source must be system, mic, or both")
-        return key
-
-    @field_validator("diarize")
-    @classmethod
-    def capture_diarize(cls, value: str) -> str:
-        key = (value or "pyannote").strip().lower()
-        if key not in {"pyannote", "vad", "ecapa"}:
-            raise ValueError("diarize must be pyannote, vad, or ecapa")
+        if key not in {"system", "mic", "both", "speakers"}:
+            raise ValueError("source must be system, mic, both, or speakers")
         return key
 
 
@@ -229,6 +219,13 @@ def clear_job(session) -> None:
 
 def recording_active() -> bool:
     return sidecar_ctl.running_pid() is not None
+
+
+def sync_ui_recording() -> None:
+    """If the capture process died, the Stop button must not stay latched on."""
+    global ui_recording
+    if ui_recording and not recording_active():
+        ui_recording = False
 
 
 def captures_dir() -> Path:
@@ -402,6 +399,7 @@ def remember_wav_duration() -> None:
 
 
 def public_state() -> dict[str, Any]:
+    sync_ui_recording()
     remember_wav_duration()
     listening = False
     last = sidecar_state.get("last_seen")
@@ -479,7 +477,10 @@ async def transcribe_pending(
                     clear_job(store.current)
                     store.current.audio_duration_s = recorded_s
                     if recorded_s < 1.0:
-                        store.current.transcribe_error = "Recording is too short to transcribe."
+                        store.current.transcribe_error = (
+                            "Recording captured no audio. Check that ffmpeg can open BlackHole "
+                            "(and the mic), then try Start recording again."
+                        )
                     elif not store.current.segments:
                         store.current.transcribe_error = "No speech found in this recording."
                     store.save()
@@ -491,7 +492,6 @@ async def transcribe_pending(
             cursor,
             recorded_s,
             APP_URL,
-            CHUNK_S,
             min_speakers,
             max_speakers,
         )
@@ -852,10 +852,9 @@ async def capture_start(request: Request, body: CaptureStartBody | None = None) 
     try:
         result = await asyncio.to_thread(
             sidecar_ctl.start,
-            payload.source,
+            "both" if payload.source == "speakers" else payload.source,
             payload.mic_device,
             APP_URL,
-            "pyannote",
             store.current.id,
             None,
         )
@@ -915,7 +914,10 @@ async def capture_stop(request: Request, body: SpeakerBounds | None = None) -> d
             should = True
             store.current.transcribe_error = None
         elif dur < 1.0:
-            store.current.transcribe_error = "Recording is too short to transcribe."
+            store.current.transcribe_error = (
+                "Recording captured no audio. Check that ffmpeg can open BlackHole "
+                "(and the mic), then try Start recording again."
+            )
         store.save()
     await broadcast({"type": "state", "state": public_state()})
     if should:
