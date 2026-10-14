@@ -30,7 +30,14 @@ from hf_offline import WHISPER_REPO, force_hf_offline, require_cached
 
 force_hf_offline()
 
-from chunk_transcribe import load_wav, process_range, process_split_channels, read_wav_range
+from chunk_transcribe import (
+    load_wav,
+    process_range,
+    process_split_channels,
+    read_wav_range,
+    speech_seconds,
+    trim_to_speech,
+)
 from diarize import configure_ssl
 from pyannote_diarize import PyannoteDiarizer
 
@@ -635,6 +642,8 @@ def transcribe_clip(audio: np.ndarray, model: str) -> list[dict]:
     """
     import mlx_whisper
 
+    skip, audio = trim_to_speech(audio)
+    skip_s = skip / float(SAMPLE_RATE)
     if audio.size < SAMPLE_RATE // 4:
         return []
     require_cached([model])
@@ -657,6 +666,24 @@ def transcribe_clip(audio: np.ndarray, model: str) -> list[dict]:
             continue
         if not str(seg.get("language") or "").strip():
             seg["language"] = lang
+        if skip_s:
+            try:
+                seg["start"] = float(seg.get("start") or 0.0) + skip_s
+                seg["end"] = float(seg.get("end") or 0.0) + skip_s
+            except (TypeError, ValueError):
+                pass
+            words = seg.get("words") or []
+            if isinstance(words, list):
+                for item in words:
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        if item.get("start") is not None:
+                            item["start"] = float(item["start"]) + skip_s
+                        if item.get("end") is not None:
+                            item["end"] = float(item["end"]) + skip_s
+                    except (TypeError, ValueError):
+                        pass
         stamped.append(seg)
     return stamped
 
@@ -694,6 +721,7 @@ class CaptureRuntime:
         self.session_id = ""
         self.recording = True
         self._channels = 1
+        self.stop_cb = None
 
     def snapshot(self) -> dict[str, object]:
         with self.lock:
@@ -811,11 +839,17 @@ def start_control_server(runtime: CaptureRuntime, port: int) -> ThreadingHTTPSer
                 snap["wav"] = str(wav)
                 self._send(200, snap)
                 return
+            if path == "/stop":
+                cb = runtime.stop_cb
+                if cb is not None:
+                    cb()
+                self._send(200, {"ok": True, "stopped": True})
+                return
             self._send(404, {"ok": False, "error": "not found"})
 
     httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     threading.Thread(target=httpd.serve_forever, name="stenopod-ctl", daemon=True).start()
-    print(f"Control API on http://127.0.0.1:{port}  (GET /status, POST /rotate)", flush=True)
+    print(f"Control API on http://127.0.0.1:{port}  (GET /status, POST /rotate, POST /stop)", flush=True)
     return httpd
 
 
@@ -906,14 +940,17 @@ def run_live(args: argparse.Namespace, client: AppClient) -> None:
 
     stopping = threading.Event()
 
-    def request_stop(signum: int, _frame) -> None:
+    def request_stop(signum: int | None = None, _frame=None) -> None:
         if stopping.is_set():
-            print("\nForce exit. The wav is already on disk.", flush=True)
-            sys.exit(128 + signum)
+            if signum:
+                print("\nForce exit. The wav is already on disk.", flush=True)
+                sys.exit(128 + signum)
+            return
         print("\nStopping capture — closing the wav.", flush=True)
         stopping.set()
         stop_ffmpeg(proc)
 
+    runtime.stop_cb = lambda: request_stop(None, None)
     previous_int = signal.signal(signal.SIGINT, request_stop)
     previous_term = signal.signal(signal.SIGTERM, request_stop)
 
@@ -965,29 +1002,81 @@ def run_file(args: argparse.Namespace, client: AppClient) -> None:
         audio = decode_file(path)
     stereo = audio.ndim == 2 and audio.shape[1] >= 2
     if stereo:
-        print("Pipeline: left=you (mic), right=them (system). Whisper on each side, then merge.")
         left = np.ascontiguousarray(audio[:, 0])
         right = np.ascontiguousarray(audio[:, 1])
-        has_local = float(np.max(np.abs(left))) >= 0.012 if left.size else False
-        remote_pipe = _remote_pipeline(args, has_local)
-        local_pipe = PyannoteDiarizer(num_speakers=1)
-        client.heartbeat(False, str(path), "file", args.model, phase="transcribing", wav=str(path))
-        process_split_channels(
-            left,
-            right,
-            0.0,
-            transcribe_clip,
-            client,
-            args.model,
-            "file",
-            remote_pipe,
-            local_pipe,
-            on_progress=client.send_progress,
-            transcribe_from=start_s,
-            min_speakers=_speaker_floor(args),
-            max_speakers=_speaker_ceiling(args),
-            local_present=has_local,
+        left_s = speech_seconds(left)
+        right_s = speech_seconds(right)
+        print(
+            f"  channel speech: you/mic {left_s:.0f}s  them/system {right_s:.0f}s",
+            flush=True,
         )
+        split_ok = left_s >= 4.0 and right_s >= 4.0
+        if not split_ok:
+            channel_label = "mixed"
+            if right_s >= 4.0 and right_s >= left_s * 2:
+                print(
+                    "Mic channel is quiet. Diarizing system audio with the Min/Max speaker count.",
+                    flush=True,
+                )
+                mono = right
+                channel_label = "them"
+            elif left_s >= 4.0:
+                print(
+                    "System channel is too quiet to split (BlackHole got little or no Meet/YouTube). "
+                    "Diarizing the mic with the Min/Max speaker count so you and a leaked remote "
+                    "voice can be two people, not one.",
+                    flush=True,
+                )
+                if right_s >= 0.5:
+                    mono = np.clip(left + right, -1.0, 1.0)
+                    channel_label = "mixed"
+                else:
+                    mono = left
+                    channel_label = "you"
+            else:
+                print(
+                    "Both channels are quiet. Mixing left+right and diarizing with Min/Max.",
+                    flush=True,
+                )
+                mono = np.clip(left + right, -1.0, 1.0)
+            pipeline = prepare_pipeline(args)
+            client.heartbeat(False, str(path), "file", args.model, phase="transcribing", wav=str(path))
+            process_range(
+                np.ascontiguousarray(mono),
+                0.0,
+                transcribe_clip,
+                client,
+                args.model,
+                "file",
+                pipeline,
+                on_progress=client.send_progress,
+                transcribe_from=start_s,
+                min_speakers=_speaker_floor(args),
+                max_speakers=_speaker_ceiling(args),
+                label=channel_label,
+            )
+        else:
+            print("Pipeline: left=you (mic), right=them (system). Whisper on each side, then merge.")
+            has_local = left_s >= 4.0
+            remote_pipe = _remote_pipeline(args, has_local)
+            local_pipe = PyannoteDiarizer(num_speakers=1)
+            client.heartbeat(False, str(path), "file", args.model, phase="transcribing", wav=str(path))
+            process_split_channels(
+                left,
+                right,
+                0.0,
+                transcribe_clip,
+                client,
+                args.model,
+                "file",
+                remote_pipe,
+                local_pipe,
+                on_progress=client.send_progress,
+                transcribe_from=start_s,
+                min_speakers=_speaker_floor(args),
+                max_speakers=_speaker_ceiling(args),
+                local_present=has_local,
+            )
     else:
         print("Pipeline: pyannote on the full recording, then Whisper")
         pipeline = prepare_pipeline(args)

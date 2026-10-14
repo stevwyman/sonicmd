@@ -19,20 +19,75 @@ WHISPER_WINDOW_S = 30.0
 WHISPER_HOP_S = 30.0
 
 
-def _report(on_progress, stage: str, chunk: int, chunks: int, progress: float) -> None:
+def trim_to_speech(
+    audio: np.ndarray,
+    sr: int = SAMPLE_RATE,
+    thresh: float = 0.01,
+    pad_s: float = 0.35,
+) -> tuple[int, np.ndarray]:
+    """Drop leading/trailing silence so Whisper is not fed 15s of zeros then speech."""
+    audio = np.ascontiguousarray(np.asarray(audio, dtype=np.float32).reshape(-1))
+    if audio.size < sr // 4:
+        return 0, audio
+    hop = max(1, int(0.02 * sr))
+    peaks = np.fromiter(
+        (float(np.max(np.abs(audio[i : i + hop]))) for i in range(0, audio.size, hop)),
+        dtype=np.float32,
+    )
+    spoken = np.flatnonzero(peaks >= thresh)
+    if spoken.size == 0:
+        return 0, audio
+    pad = int(pad_s * sr)
+    start = max(0, int(spoken[0]) * hop - pad)
+    end = min(audio.size, int(spoken[-1]) * hop + hop + pad)
+    if end - start < sr // 4:
+        return 0, audio
+    return start, audio[start:end]
+
+
+def speech_seconds(audio: np.ndarray, thresh: float = 0.015) -> float:
+    """How many seconds of this channel sit above a speech-like peak."""
+    x = np.ascontiguousarray(np.asarray(audio, dtype=np.float32).reshape(-1))
+    hop = max(1, int(0.02 * SAMPLE_RATE))
+    n = (x.size // hop) * hop
+    if n <= 0:
+        return 0.0
+    peaks = np.max(np.abs(x[:n].reshape(-1, hop)), axis=1)
+    return float(np.count_nonzero(peaks >= thresh) * hop / SAMPLE_RATE)
+
+
+def _report(
+    on_progress,
+    stage: str,
+    chunk: int,
+    chunks: int,
+    progress: float,
+    channel: str | None = None,
+) -> None:
     if on_progress is None:
         return
+    payload = {
+        "stage": stage,
+        "chunk": int(chunk),
+        "chunks": int(chunks),
+        "progress": max(0.0, min(1.0, float(progress))),
+    }
+    if channel:
+        payload["channel"] = channel
     try:
-        on_progress(
-            {
-                "stage": stage,
-                "chunk": int(chunk),
-                "chunks": int(chunks),
-                "progress": max(0.0, min(1.0, float(progress))),
-            }
-        )
+        on_progress(payload)
     except Exception as exc:
         print(f"progress failed: {exc}", flush=True)
+
+
+def _progress_channel(label: str | None) -> str | None:
+    if label == "you":
+        return "left"
+    if label == "them":
+        return "right"
+    if label == "mixed":
+        return "mixed"
+    return None
 
 
 def load_wav(path: Path, end_s: float | None = None) -> np.ndarray:
@@ -110,8 +165,20 @@ def _segment_usable(segment: dict) -> bool:
     if no_speech > 0.6 or compression > 2.4 or logprob < -1.0:
         return False
     duration = max(0.0, end - start)
+    raw_words = segment.get("words") or []
+    if isinstance(raw_words, list) and len(raw_words) >= 2:
+        try:
+            starts = [float(item.get("start")) for item in raw_words if isinstance(item, dict) and item.get("start") is not None]
+            ends = [float(item.get("end")) for item in raw_words if isinstance(item, dict) and item.get("end") is not None]
+            if starts and ends and max(ends) > min(starts):
+                duration = max(ends) - min(starts)
+        except (TypeError, ValueError):
+            pass
     words = [tok for tok in text.split() if any(ch.isalpha() for ch in tok)]
-    if duration >= 3.0 and words and len(words) / duration < 0.8:
+    # Music stings are a handful of tokens over several seconds. A real
+    # sentence can sit at the end of a 30s window whose timestamps still
+    # cover the silent lead-in; do not drop those.
+    if duration >= 3.0 and words and len(words) / duration < 0.8 and len(words) < 12:
         return False
     return True
 
@@ -688,6 +755,7 @@ def process_range(
     transcribe_from: float = 0.0,
     min_speakers: int | None = None,
     max_speakers: int | None = None,
+    label: str | None = None,
 ) -> int:
     """Pyannote labels the whole buffer once. Whisper then transcribes it in
     30s windows, and each word keeps the speaker who was talking at that time.
@@ -706,6 +774,7 @@ def process_range(
         transcribe_from=transcribe_from,
         min_speakers=min_speakers,
         max_speakers=max_speakers,
+        label=label,
     )
     return emit_blocks(blocks, client, source, audio, origin_s, pipeline)
 
@@ -809,13 +878,14 @@ def blocks_from_audio(
     audio = np.ascontiguousarray(np.asarray(audio, dtype=np.float32).reshape(-1))
     audio_s = audio.size / SAMPLE_RATE if audio.size else 0.0
     tag = f"{label} " if label else ""
+    channel = _progress_channel(label)
     if audio.size < int(MIN_SPEECH_S * SAMPLE_RATE):
-        _report(on_progress, "whisper", 1, 1, 1.0)
+        _report(on_progress, "whisper", 1, 1, 1.0, channel=channel)
         return []
     peak = float(np.max(np.abs(audio))) if audio.size else 0.0
     if peak < 0.008:
         print(f"  skip {tag}{origin_s:.0f}s–{origin_s + audio_s:.0f}s (near silence)", flush=True)
-        _report(on_progress, "whisper", 1, 1, 1.0)
+        _report(on_progress, "whisper", 1, 1, 1.0, channel=channel)
         return []
     if pipeline is None:
         raise RuntimeError("Speaker labels need pyannote on the full recording.")
@@ -825,7 +895,7 @@ def blocks_from_audio(
         f"(min={min_speakers or 'auto'} max={max_speakers or 'auto'})",
         flush=True,
     )
-    _report(on_progress, "pyannote", 0, 0, 0.08)
+    _report(on_progress, "pyannote", 0, 0, 0.08, channel=channel)
     turns = pipeline.segment(audio, min_duration=MIN_TURN_S, fill_gaps=False)
     spans = speaker_spans(turns)
     speakers = sorted({letter for _s, _e, letter in spans})
@@ -834,9 +904,9 @@ def blocks_from_audio(
         f"{len(speakers)} speakers ({', '.join(speakers) or 'none'})",
         flush=True,
     )
-    _report(on_progress, "pyannote", 0, 0, 0.35)
+    _report(on_progress, "pyannote", 0, 0, 0.35, channel=channel)
     if not spans:
-        _report(on_progress, "whisper", 1, 1, 1.0)
+        _report(on_progress, "whisper", 1, 1, 1.0, channel=channel)
         return []
 
     window = int(WHISPER_WINDOW_S * SAMPLE_RATE)
@@ -845,7 +915,7 @@ def blocks_from_audio(
     total = len(starts)
     decoded: list[tuple[float, float, list[tuple[float, float, str, float, str]]]] = []
     for index, offset in enumerate(starts, start=1):
-        _report(on_progress, "whisper", index, total, 0.35 + 0.55 * ((index - 1) / total))
+        _report(on_progress, "whisper", index, total, 0.35 + 0.55 * ((index - 1) / total), channel=channel)
         clip = audio[offset : offset + window]
         if clip.size < int(MIN_SPEECH_S * SAMPLE_RATE):
             continue
@@ -871,7 +941,7 @@ def blocks_from_audio(
                 continue
             words.extend(picked)
         decoded.append((offset_s, win_end, words))
-        _report(on_progress, "whisper", index, total, 0.35 + 0.55 * (index / total))
+        _report(on_progress, "whisper", index, total, 0.35 + 0.55 * (index / total), channel=channel)
 
     words = reconcile_window_words(decoded)
     return words_to_blocks(

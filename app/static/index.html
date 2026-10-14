@@ -4,23 +4,21 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>StenoPod</title>
+    <link rel="icon" type="image/jpeg" href="/static/logo.jpg" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
       rel="stylesheet"
       href="https://fonts.googleapis.com/css2?family=Red+Hat+Display:wght@500;700&family=Red+Hat+Mono:wght@400;500&family=Red+Hat+Text:wght@400;500&display=swap"
     />
-    <link rel="stylesheet" href="/static/styles.css?v=20260927b" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260930a" />
   </head>
   <body>
     <header class="mast">
       <div class="mast-inner">
         <div class="brand">
-          <span class="mark" aria-hidden="true"></span>
-          <div>
-            <h1>StenoPod</h1>
-            <p class="tag">Transcription starts when recording stops</p>
-          </div>
+          <img class="brand-logo" src="/static/logo.jpg" alt="" width="40" height="40" />
+          <h1>StenoPod</h1>
         </div>
         <div class="lamps" aria-label="Status">
           <span class="lamp" id="lamp-listen"><i></i><span class="lamp-name">Sidecar</span><span class="lamp-state">idle</span></span>
@@ -59,6 +57,7 @@
         <div id="job-bar" class="job-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
           <i id="job-fill"></i>
         </div>
+        <pre id="job-log" class="job-log" hidden></pre>
       </div>
 
       <section class="recordings" aria-labelledby="rec-h">
@@ -76,18 +75,21 @@
         <section class="pad" aria-labelledby="tx-h">
           <h2 id="tx-h">Transcript</h2>
           <ul id="roster" class="roster" aria-label="Speakers"></ul>
-          <p class="hint" id="rename-hint" hidden>Click a speaker to rename.</p>
+          <p class="hint" id="rename-hint" hidden>Click a speaker to rename. Then press Write notes to refresh the summary.</p>
           <ol id="transcript" class="takes"></ol>
-          <p class="empty" id="tx-empty">Choose StenoPod Speakers or Headphones, then press <strong>Start recording</strong>. Transcription starts when you stop.</p>
+          <p class="empty" id="tx-empty">Choose StenoPod Speakers or Headphones, then press <strong>Start recording</strong>. Press <strong>Transcribe</strong> when you are done.</p>
         </section>
         <section class="copy" aria-labelledby="nt-h">
-          <h2 id="nt-h">Markdown notes</h2>
+          <div class="copy-head">
+            <h2 id="nt-h">Markdown notes</h2>
+            <button type="button" id="btn-notes" disabled>Write notes</button>
+          </div>
           <article id="notes" class="prose"></article>
-          <p class="empty" id="nt-empty">Notes are written after transcription finishes.</p>
+          <p class="empty" id="nt-empty">Rename speakers if you want, then press <strong>Write notes</strong>.</p>
           <p class="err" id="nt-err" hidden></p>
         </section>
       </main>
     </div>
-    <script src="/static/app.js?v=20260928e"></script>
+    <script src="/static/app.js?v=20260930a"></script>
   </body>
 </html>

@@ -35,6 +35,7 @@ def sidecar_script() -> Path:
 
 
 _capture_proc: subprocess.Popen[bytes] | None = None
+_file_proc: subprocess.Popen[bytes] | None = None
 
 
 def _reap_child(pid: int) -> bool:
@@ -79,7 +80,7 @@ def running_pid() -> int | None:
     return found[0] if found else None
 
 
-def _pgrep(include_file: bool = False) -> list[int]:
+def _pgrep(include_file: bool = False, file_only: bool = False) -> list[int]:
     try:
         out = subprocess.check_output(["ps", "-ax", "-o", "pid=,command="], text=True)
     except (subprocess.CalledProcessError, FileNotFoundError):
@@ -90,7 +91,10 @@ def _pgrep(include_file: bool = False) -> list[int]:
         if needle not in line or "pgrep" in line:
             continue
         pid_s, _, cmd = line.strip().partition(" ")
-        if not include_file and "--file" in cmd:
+        has_file = "--file" in cmd
+        if file_only and not has_file:
+            continue
+        if not include_file and not file_only and has_file:
             continue
         if pid_s.isdigit() and "sidecar.py" in cmd:
             pids.append(int(pid_s))
@@ -177,6 +181,7 @@ def process_file(
     min_speakers: int | None = None,
     max_speakers: int | None = None,
 ) -> dict[str, Any]:
+    global _file_proc
     py = python_bin()
     if not py.is_file():
         return {"ok": False, "error": "Host venv missing. Run `make sidecar-venv`."}
@@ -201,10 +206,75 @@ def process_file(
             cmd.extend(["--max-speakers", str(max_speakers)])
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     log = LOG_FILE.open("ab")
-    proc = subprocess.run(cmd, cwd=str(REPO_ROOT), stdout=log, stderr=subprocess.STDOUT)
-    if proc.returncode != 0:
-        return {"ok": False, "error": _transcribe_failure(proc.returncode)}
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(REPO_ROOT),
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+    )
+    _file_proc = proc
+    try:
+        code = proc.wait()
+    finally:
+        if _file_proc is proc:
+            _file_proc = None
+    if code != 0:
+        if _was_killed(code):
+            return {"ok": False, "stopped": True, "error": "Transcription stopped."}
+        return {"ok": False, "error": _transcribe_failure(code)}
     return {"ok": True, "start_s": start_s, "end_s": end_s, "wav": wav}
+
+
+def _was_killed(code: int | None) -> bool:
+    if code is None:
+        return False
+    if code < 0:
+        return True
+    return code in {128 + signal.SIGINT, 128 + signal.SIGTERM, 128 + signal.SIGKILL, 137, 143}
+
+
+def _kill_pids(pids: set[int], graceful_s: float = 3.0) -> None:
+    for pid in list(pids):
+        if not _pid_alive(pid):
+            pids.discard(pid)
+            continue
+        try:
+            os.kill(pid, signal.SIGINT)
+        except OSError:
+            continue
+    deadline = time.time() + graceful_s
+    while time.time() < deadline and any(_pid_alive(pid) for pid in pids):
+        time.sleep(0.15)
+    for pid in pids:
+        if not _pid_alive(pid):
+            continue
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except OSError:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+
+def stop_file() -> dict[str, Any]:
+    global _file_proc
+    pids = set(_pgrep(file_only=True))
+    if _file_proc is not None and _file_proc.poll() is None:
+        pids.add(_file_proc.pid)
+    if not pids:
+        _file_proc = None
+        return {"ok": True, "stopped": False}
+    _kill_pids(pids, graceful_s=1.5)
+    if _file_proc is not None:
+        try:
+            _file_proc.wait(timeout=1)
+        except Exception:
+            pass
+        _file_proc = None
+    return {"ok": True, "stopped": True}
 
 
 def start(
@@ -265,45 +335,30 @@ def start(
 
 
 def stop(include_file: bool = False) -> dict[str, Any]:
-    global _capture_proc
+    global _capture_proc, _file_proc
+    _ctl("POST", "/stop", timeout=2.0)
     pids = set(_pgrep(include_file=include_file))
     tracked = running_pid()
     if tracked:
         pids.add(tracked)
     if _capture_proc is not None:
         pids.add(_capture_proc.pid)
+    if include_file:
+        pids.update(_pgrep(file_only=True))
+        if _file_proc is not None and _file_proc.poll() is None:
+            pids.add(_file_proc.pid)
     if not pids:
         PID_FILE.unlink(missing_ok=True)
         _capture_proc = None
         return {"ok": True, "stopped": False}
-    for pid in list(pids):
-        if not _pid_alive(pid):
-            pids.discard(pid)
-            continue
-        try:
-            os.kill(pid, signal.SIGINT)
-        except OSError:
-            continue
-    # Recording only writes a wav. The sidecar closes it after ffmpeg exits.
-    deadline = time.time() + 12
-    while time.time() < deadline and any(_pid_alive(pid) for pid in pids):
-        time.sleep(0.2)
-    for pid in pids:
-        if not _pid_alive(pid):
-            continue
-        try:
-            os.killpg(pid, signal.SIGKILL)
-        except OSError:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
-        _pid_alive(pid)
+    _kill_pids(pids, graceful_s=3.0)
     if _capture_proc is not None:
         try:
             _capture_proc.wait(timeout=1)
         except Exception:
             pass
         _capture_proc = None
+    if include_file:
+        _file_proc = None
     PID_FILE.unlink(missing_ok=True)
     return {"ok": True, "stopped": True}

@@ -67,10 +67,10 @@ class Session(BaseModel):
         custom = self.speaker_names.get(speaker, "").strip()
         return custom or f"Speaker {speaker}"
 
-    def pending_text(self) -> str:
-        pending = self.segments[self.last_summarized_index :]
+    def pending_text(self, start: int | None = None) -> str:
+        index = self.last_summarized_index if start is None else max(0, start)
         lines = []
-        for s in pending:
+        for s in self.segments[index:]:
             lines.append(f"[{self.speaker_label(s.speaker)} | {s.t} | {s.lang}] {s.text}")
         return "\n".join(lines).strip()
 

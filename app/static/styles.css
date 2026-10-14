@@ -55,12 +55,12 @@ body {
 }
 
 .brand { display: flex; gap: 12px; align-items: center; }
-.mark {
+.brand-logo {
   width: 36px;
   height: 36px;
-  background: var(--rh-red);
-  clip-path: polygon(50% 8%, 100% 38%, 82% 100%, 18% 100%, 0 38%);
+  object-fit: contain;
   flex-shrink: 0;
+  border-radius: 4px;
 }
 h1 {
   margin: 0;
@@ -153,8 +153,16 @@ h1 {
   border: 1px solid #6a6e73;
   padding: 6px 8px;
 }
-button#btn-capture.stop {
+button.stop {
   background: transparent;
+  border-color: #6a6e73;
+}
+button.stop:hover,
+button.stop:disabled:hover {
+  background: transparent;
+  border-color: #fff;
+}
+button.stop:disabled:hover {
   border-color: #6a6e73;
 }
 button, a.ghost {
@@ -205,6 +213,16 @@ button.ghost:disabled:hover { background: transparent; border-color: #6a6e73; }
 .device { margin: 0 0 10px; font-family: var(--mono); font-size: 12px; color: var(--rh-gray-600); min-height: 1em; }
 .job { margin: 0 0 18px; }
 .job-label { margin: 0 0 6px; font-family: var(--mono); font-size: 12px; color: var(--rh-gray-600); }
+.job-log {
+  margin: 8px 0 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--rh-gray-600);
+  white-space: pre-wrap;
+  background: transparent;
+  border: 0;
+  padding: 0;
+}
 .job-bar {
   height: 8px;
   background: var(--rh-gray-200);
@@ -333,6 +351,25 @@ h2 {
   letter-spacing: 0;
   text-transform: none;
   color: var(--rh-black);
+}
+.copy-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 14px;
+}
+.copy-head h2 { margin: 0; }
+.copy-head button { flex-shrink: 0; }
+.copy-head button.stop {
+  color: var(--rh-black);
+  border-color: var(--rh-gray-600);
+}
+.copy-head button.stop:hover,
+.copy-head button.stop:disabled:hover {
+  color: var(--rh-black);
+  background: transparent;
+  border-color: var(--rh-black);
 }
 
 .roster {

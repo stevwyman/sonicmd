@@ -121,6 +121,8 @@ let pendingJob = null;
 let pollTimer = null;
 let recordStartedAt = null;
 let recordTick = null;
+let captureBusy = false;
+let captureStopping = false;
 
 function formatDay(iso) {
   try {
@@ -304,14 +306,24 @@ function renderJob(job) {
   const box = $("job");
   const bar = $("job-bar");
   const fill = $("job-fill");
+  const logEl = $("job-log");
   if (!job || !job.label) {
     box.hidden = true;
     bar.classList.remove("indeterminate");
     fill.style.width = "0";
+    if (logEl) {
+      logEl.hidden = true;
+      logEl.textContent = "";
+    }
     return;
   }
   box.hidden = false;
   $("job-label").textContent = job.label;
+  if (logEl) {
+    const lines = Array.isArray(job.log) ? job.log.filter(Boolean) : [];
+    logEl.hidden = lines.length === 0;
+    logEl.textContent = lines.join("\n");
+  }
   const pct = job.progress == null ? null : Math.round(Math.max(0, Math.min(1, Number(job.progress))) * 100);
   if (pct == null) {
     bar.classList.add("indeterminate");
@@ -356,7 +368,7 @@ function render(state) {
   if (showJob) {
     setLamp("lamp-listen", "busy");
   } else if (listening) {
-    $("device").textContent = `Recording ${formatClock(duration)}. Transcription starts when you stop. ${route}`;
+    $("device").textContent = `Recording ${formatClock(duration)}. ${route}`;
     setLamp("lamp-listen", "on");
   } else if (state.transcribe_error) {
     const lines = String(state.transcribe_error).split("\n").map((line) => line.trim()).filter(Boolean);
@@ -366,7 +378,7 @@ function render(state) {
     $("device").textContent = `Recording saved · ${formatClock(duration)}. Press Transcribe.`;
     setLamp("lamp-listen", "");
   } else if (transcribed) {
-    $("device").textContent = `Transcribed · ${formatClock(duration)}.`;
+    $("device").textContent = `Transcribed · ${formatClock(duration)}. Rename speakers, then Write notes.`;
     setLamp("lamp-listen", "");
   } else {
     $("device").textContent = route;
@@ -381,7 +393,8 @@ function render(state) {
   $("spk-min").disabled = busy;
   $("spk-max").disabled = busy;
   $("btn-new").disabled = listening || busy;
-  $("btn-transcribe").disabled = listening || busy || !hasRecording || transcribed;
+  syncTranscribeButton(state, listening, busy, hasRecording, transcribed);
+  syncNotesButton(state, listening, busy);
   syncCaptureButton(listening, Boolean(state.capture && state.capture.running), busy, hasRecording);
 
   const roster = $("roster");
@@ -413,11 +426,11 @@ function render(state) {
     if (state.transcribing || (pendingJob && pendingJob.kind === "transcribe")) {
       $("tx-empty").innerHTML = "Speakers first, on the whole recording. Whisper writes each turn as it finishes.";
     } else if (listening) {
-      $("tx-empty").innerHTML = `Recording ${formatClock(duration)}. Transcription starts when you stop.`;
+      $("tx-empty").innerHTML = `Recording ${formatClock(duration)}.`;
     } else if (hasRecording) {
-      $("tx-empty").innerHTML = "Recording saved. Transcription should already be running. Press <strong>Transcribe</strong> if it is not.";
+      $("tx-empty").innerHTML = "Recording saved. Press <strong>Transcribe</strong> when you want the transcript.";
     } else {
-      $("tx-empty").innerHTML = "Choose StenoPod Speakers or Headphones, then press <strong>Start recording</strong>. Transcription starts when you stop.";
+      $("tx-empty").innerHTML = "Choose StenoPod Speakers or Headphones, then press <strong>Start recording</strong>. Press <strong>Transcribe</strong> when you are done.";
     }
   }
   $("notes").innerHTML = renderMarkdown(state.notes || "");
@@ -459,19 +472,72 @@ function connectWs() {
   ws.onclose = () => setTimeout(connectWs, 1500);
 }
 
+function syncTranscribeButton(state, listening, busy, hasRecording, transcribed) {
+  const btn = $("btn-transcribe");
+  if (!btn) return;
+  const stoppingTx = Boolean(btn.dataset.stopping === "1");
+  const jobRunning = Boolean(
+    state.transcribing ||
+      (state.job && state.job.kind === "transcribe") ||
+      (pendingJob && pendingJob.kind === "transcribe")
+  );
+  if (stoppingTx) {
+    btn.disabled = true;
+    btn.classList.add("stop");
+    btn.textContent = "Stopping…";
+    return;
+  }
+  if (jobRunning && !listening) {
+    btn.disabled = false;
+    btn.classList.add("stop");
+    btn.textContent = "Stop transcription";
+    return;
+  }
+  btn.classList.remove("stop");
+  btn.textContent = "Transcribe";
+  btn.disabled = listening || busy || !hasRecording || transcribed;
+}
+
+function syncNotesButton(state, listening, busy) {
+  const btn = $("btn-notes");
+  if (!btn) return;
+  const hasTurns = Number(state.segment_count || 0) > 0 || (state.segments || []).length > 0;
+  const stopping = Boolean(btn.dataset.stopping === "1");
+  const running = Boolean(
+    state.summarizing ||
+      (state.job && state.job.kind === "notes") ||
+      (pendingJob && pendingJob.kind === "notes")
+  );
+  if (stopping) {
+    btn.disabled = true;
+    btn.classList.add("stop");
+    btn.textContent = "Stopping…";
+    return;
+  }
+  if (running && !listening) {
+    btn.disabled = false;
+    btn.classList.add("stop");
+    btn.textContent = "Stop notes";
+    return;
+  }
+  btn.classList.remove("stop");
+  btn.textContent = state.notes ? "Update notes" : "Write notes";
+  btn.disabled = listening || Boolean(state.transcribing) || !hasTurns || (busy && !running);
+}
+
 function syncCaptureButton(listening, running, busy, hasRecording) {
   const btn = $("btn-capture");
   if (!btn) return;
-  if (listening) {
+  if (captureStopping) {
+    btn.disabled = true;
+    btn.classList.add("stop");
+    btn.textContent = "Stopping…";
+    return;
+  }
+  if (listening || running) {
     btn.disabled = Boolean(busy);
     btn.classList.add("stop");
     btn.textContent = "Stop recording";
-    return;
-  }
-  if (running && !busy) {
-    btn.disabled = true;
-    btn.classList.remove("stop");
-    btn.textContent = "Starting…";
     return;
   }
   if (hasRecording) {
@@ -554,54 +620,52 @@ function apiError(body, fallback) {
 
 $("btn-capture").addEventListener("click", async () => {
   const btn = $("btn-capture");
-  const listening = btn.classList.contains("stop");
-  btn.disabled = true;
+  if (captureBusy) return;
+  const shouldStop =
+    captureStopping ||
+    btn.classList.contains("stop") ||
+    Boolean(lastState && lastState.sidecar && lastState.sidecar.listening) ||
+    Boolean(lastState && lastState.capture && lastState.capture.running);
+  captureBusy = true;
   try {
-    if (listening) {
+    if (shouldStop) {
+      captureStopping = true;
+      btn.disabled = true;
+      btn.classList.add("stop");
       btn.textContent = "Stopping…";
-      pendingJob = { kind: "transcribe", label: "Stopping recording. Transcription starts next.", progress: null };
-      if (lastState) render(lastState);
       const r = await fetch("/api/capture/stop", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(speakerBounds()),
       });
       const body = await r.json().catch(() => ({}));
-      pendingJob = null;
       if (!r.ok) throw new Error(apiError(body, r.statusText));
+      captureStopping = false;
       if (body.state) render(body.state);
       else fetchState();
     } else {
       btn.textContent = "Starting…";
+      btn.disabled = true;
       const startBody = JSON.stringify({
         source: $("capture-source").value,
       });
-      let r = await fetch("/api/capture/start", {
+      const r = await fetch("/api/capture/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: startBody,
       });
-      let body = await r.json().catch(() => ({}));
-      if (r.status === 409 && /already running/i.test(apiError(body, ""))) {
-        await fetch("/api/capture/stop", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(speakerBounds()),
-        });
-        r = await fetch("/api/capture/start", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: startBody,
-        });
-        body = await r.json().catch(() => ({}));
-      }
+      const body = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(apiError(body, r.statusText));
       if (body.state) render(body.state);
+      else fetchState();
     }
   } catch (err) {
     pendingJob = null;
     alert(err.message || String(err));
     fetchState().catch(() => {});
+  } finally {
+    captureStopping = false;
+    captureBusy = false;
   }
 });
 
@@ -682,6 +746,26 @@ $("recordings").addEventListener("click", (ev) => {
 });
 
 $("btn-transcribe").addEventListener("click", async () => {
+  const btn = $("btn-transcribe");
+  const stopping = btn.classList.contains("stop");
+  if (stopping) {
+    btn.dataset.stopping = "1";
+    btn.disabled = true;
+    btn.textContent = "Stopping…";
+    try {
+      const r = await fetch("/api/transcribe/stop", { method: "POST" });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(apiError(body, r.statusText));
+      pendingJob = null;
+      render(body);
+    } catch (err) {
+      alert(err.message || String(err));
+      fetchState();
+    } finally {
+      delete btn.dataset.stopping;
+    }
+    return;
+  }
   pendingJob = { kind: "transcribe", label: "Starting transcription", progress: null };
   if (lastState) render(lastState);
   try {
@@ -690,6 +774,42 @@ $("btn-transcribe").addEventListener("click", async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(speakerBounds()),
     });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(apiError(body, r.statusText));
+    pendingJob = null;
+    render(body);
+  } catch (err) {
+    pendingJob = null;
+    alert(err.message || String(err));
+    fetchState();
+  }
+});
+
+$("btn-notes").addEventListener("click", async () => {
+  const btn = $("btn-notes");
+  const stopping = btn.classList.contains("stop");
+  if (stopping) {
+    btn.dataset.stopping = "1";
+    btn.disabled = true;
+    btn.textContent = "Stopping…";
+    try {
+      const r = await fetch("/api/transcribe/stop", { method: "POST" });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(apiError(body, r.statusText));
+      pendingJob = null;
+      render(body);
+    } catch (err) {
+      alert(err.message || String(err));
+      fetchState();
+    } finally {
+      delete btn.dataset.stopping;
+    }
+    return;
+  }
+  pendingJob = { kind: "notes", label: "Notes", progress: null };
+  if (lastState) render(lastState);
+  try {
+    const r = await fetch("/api/summarize", { method: "POST" });
     const body = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(apiError(body, r.statusText));
     pendingJob = null;
