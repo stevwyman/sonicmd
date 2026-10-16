@@ -63,6 +63,7 @@ sidecar_state: dict[str, Any] = {
     "recorded_s": None,
     "wav": None,
     "last_seen": None,
+    "levels": None,
 }
 # True only while a UI recording is in progress.
 ui_recording = False
@@ -119,6 +120,19 @@ class SidecarStatus(BaseModel):
     phase: str | None = None
     recorded_s: float | None = None
     wav: str | None = None
+
+
+class LevelBody(BaseModel):
+    channels: int = 1
+    left: float = 0.0
+    right: float = 0.0
+
+    @field_validator("left", "right")
+    @classmethod
+    def unit_level(cls, value: float) -> float:
+        if not math.isfinite(float(value)):
+            return 0.0
+        return max(0.0, min(1.0, float(value)))
 
 
 class SpeakerNameBody(BaseModel):
@@ -535,6 +549,7 @@ def public_state() -> dict[str, Any]:
             "phase": sidecar_state.get("phase"),
             "recorded_s": recorded if listening else snap["audio_duration_s"],
             "wav": sidecar_state.get("wav") or store.current.audio_path,
+            "levels": sidecar_state.get("levels") if listening else None,
         },
         "capture": sidecar_ctl.status(),
     }
@@ -592,8 +607,8 @@ async def transcribe_pending(
                     store.current.audio_duration_s = recorded_s
                     if recorded_s < 1.0:
                         store.current.transcribe_error = (
-                            "Recording captured no audio. Check that ffmpeg can open BlackHole "
-                            "(and the mic), then try Start recording again."
+                            "Recording captured no audio. Set Sound → Output to the StenoPod device "
+                            "you selected. For Headphones, Input must be the MacBook microphone."
                         )
                     elif not store.current.segments:
                         store.current.transcribe_error = "No speech found in this recording."
@@ -945,7 +960,29 @@ async def sidecar_heartbeat(body: SidecarStatus) -> dict[str, Any]:
             "last_seen": utc_now(),
         }
     )
+    if not body.listening:
+        sidecar_state["levels"] = None
     await broadcast({"type": "state", "state": public_state()})
+    return {"ok": True}
+
+
+def _clip_level(value: float) -> float:
+    if not math.isfinite(value):
+        return 0.0
+    return max(0.0, min(1.0, value))
+
+
+@app.post("/api/sidecar/levels")
+async def sidecar_levels(body: LevelBody) -> dict[str, Any]:
+    if suppress_listening or not sidecar_state.get("listening"):
+        return {"ok": True, "ignored": True}
+    levels = {
+        "channels": 2 if int(body.channels) >= 2 else 1,
+        "left": _clip_level(body.left),
+        "right": _clip_level(body.right),
+    }
+    sidecar_state["levels"] = levels
+    await broadcast({"type": "levels", "levels": levels})
     return {"ok": True}
 
 
@@ -1004,10 +1041,12 @@ async def capture_start(request: Request, body: CaptureStartBody | None = None) 
         if dur > 1.0:
             raise HTTPException(409, "This meeting already has a recording. Start a new meeting first.")
     try:
+        # Speakers is the meeting mix only. Headphones is the stereo mic + meeting capture.
+        capture_source = "system" if payload.source in {"speakers", "system"} else payload.source
         result = await asyncio.to_thread(
             sidecar_ctl.start,
-            "both" if payload.source == "speakers" else payload.source,
-            payload.mic_device,
+            capture_source,
+            payload.mic_device if capture_source == "both" else None,
             APP_URL,
             store.current.id,
             None,
@@ -1063,8 +1102,8 @@ async def capture_stop(request: Request, body: SpeakerBounds | None = None) -> d
                 log.exception("Could not read wav duration after stop")
         if dur < 1.0:
             store.current.transcribe_error = (
-                "Recording captured no audio. Check that ffmpeg can open BlackHole "
-                "(and the mic), then try Start recording again."
+                "Recording captured no audio. Set Sound → Output to the StenoPod device "
+                "you selected. For Headphones, Input must be the MacBook microphone."
             )
         else:
             store.current.transcribe_error = None

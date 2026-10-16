@@ -399,51 +399,22 @@ def _read_pipe(stream, nbytes: int) -> bytes:
     return bytes(buf)
 
 
-MAX_ECHO_LAG = int(0.08 * SAMPLE_RATE)  # 80ms speaker-to-mic path
-
-
-class MixState:
-    """Keep channels apart: left = echo-cancelled mic, right = BlackHole."""
+class MicGain:
+    """Lift a quiet Mac mic on the left channel. The right channel stays untouched."""
 
     def __init__(self) -> None:
         self.gain = 6.0
-        self.bh_hist = np.zeros(MAX_ECHO_LAG, dtype=np.float32)
-        self.lag_ms = 0.0
-        self.alpha = 0.0
         self.speech_peak = 0.0
 
-    def mix(self, bh: np.ndarray, mic: np.ndarray) -> np.ndarray:
-        bh = np.asarray(bh, dtype=np.float32)
+    def apply(self, mic: np.ndarray) -> np.ndarray:
         mic = np.asarray(mic, dtype=np.float32)
-        n = int(mic.size)
-        if n == 0:
-            return bh
-        hist = np.concatenate([self.bh_hist, bh])
-        bh_rms = float(np.sqrt(np.mean(bh * bh))) if bh.size else 0.0
-        if bh_rms >= 0.006 and hist.size >= n:
-            corr = np.correlate(hist, mic, mode="valid")
-            idx = int(np.argmax(corr))
-            idx = min(max(0, idx), hist.size - n)
-            ref = hist[idx : idx + n]
-            denom = float(np.dot(ref, ref)) + 1e-8
-            alpha = max(0.0, min(1.4, float(corr[idx]) / denom))
-            cleaned = mic - alpha * ref
-            self.alpha = alpha
-            self.lag_ms = 1000.0 * (hist.size - n - idx) / SAMPLE_RATE
-        else:
-            cleaned = mic
-            self.alpha = 0.0
-        self.bh_hist = hist[-MAX_ECHO_LAG :]
         raw_peak = float(np.max(np.abs(mic))) if mic.size else 0.0
         self.speech_peak = max(self.speech_peak, raw_peak)
-        peak = float(np.max(np.abs(cleaned))) if cleaned.size else 0.0
-        if peak >= 0.012:
-            desired = min(12.0, max(2.0, 0.22 / peak))
+        if raw_peak >= 0.012:
+            desired = min(12.0, max(2.0, 0.22 / raw_peak))
             self.gain = 0.88 * self.gain + 0.12 * desired
-            boosted = np.clip(cleaned * self.gain, -1.0, 1.0)
-        else:
-            boosted = np.clip(cleaned, -1.0, 1.0)
-        return np.stack([boosted, bh], axis=1)
+            return np.clip(mic * self.gain, -1.0, 1.0)
+        return np.clip(mic, -1.0, 1.0)
 
 
 def frames_from_proc(proc: subprocess.Popen[bytes], channels: int = 1) -> Iterator[np.ndarray]:
@@ -458,7 +429,7 @@ def frames_from_proc(proc: subprocess.Popen[bytes], channels: int = 1) -> Iterat
     log_every = max(1, int(5.0 * 1000 / FRAME_MS))
     warned_bh = False
     warned_mic = False
-    mix = MixState()
+    mic_gain = MicGain()
     while True:
         raw = _read_pipe(proc.stdout, nbytes)
         if not raw:
@@ -487,8 +458,8 @@ def frames_from_proc(proc: subprocess.Popen[bytes], channels: int = 1) -> Iterat
                 first = False
             if n_frames % log_every == 0:
                 print(
-                    f"  levels ~5s: BlackHole {bh_peak:.4f}  mic {mic_peak:.4f}  "
-                    f"(mic×{mix.gain:.0f}, aec {mix.lag_ms:.0f}ms α={mix.alpha:.2f})",
+                    f"  levels ~5s: meeting/right {bh_peak:.4f}  you/left {mic_peak:.4f}  "
+                    f"(mic×{mic_gain.gain:.0f})",
                     flush=True,
                 )
                 if bh_peak < 0.008 and mic_peak >= 0.008 and not warned_bh:
@@ -501,7 +472,7 @@ def frames_from_proc(proc: subprocess.Popen[bytes], channels: int = 1) -> Iterat
                         flush=True,
                     )
                     warned_bh = True
-                if n_frames >= log_every * 2 and mix.speech_peak < 0.02 and not warned_mic:
+                if n_frames >= log_every * 2 and mic_gain.speech_peak < 0.02 and not warned_mic:
                     print(
                         "  Mac microphone is still barely audible. Set Sound → Input to\n"
                         "  MacBook Air-Mikrofon (not AirPods) and turn the Input volume up.",
@@ -510,7 +481,7 @@ def frames_from_proc(proc: subprocess.Popen[bytes], channels: int = 1) -> Iterat
                     warned_mic = True
                 bh_peak = 0.0
                 mic_peak = 0.0
-            frame = mix.mix(bh, mic)
+            frame = np.stack([mic_gain.apply(mic), bh], axis=1)
         else:
             frame = pcm
             if first:
@@ -549,6 +520,20 @@ class AppClient:
         self.base_url = base_url.rstrip("/")
         self.http = httpx.Client(timeout=10.0)
         self._lock = threading.Lock()
+
+    def send_levels(self, channels: int, left: float, right: float) -> None:
+        try:
+            with self._lock:
+                self.http.post(
+                    f"{self.base_url}/api/sidecar/levels",
+                    json={
+                        "channels": int(channels),
+                        "left": float(left),
+                        "right": float(right),
+                    },
+                )
+        except httpx.HTTPError:
+            pass
 
     def heartbeat(
         self,
@@ -711,6 +696,16 @@ def heartbeat_loop(
     client.heartbeat(False, device, source, model)
 
 
+def level_loop(client: AppClient, shutdown: threading.Event, runtime: "CaptureRuntime") -> None:
+    """Push meter levels often enough for the UI bars to follow speech."""
+    while not shutdown.is_set():
+        snap = runtime.levels()
+        client.send_levels(int(snap["channels"]), float(snap["left"]), float(snap["right"]))
+        if shutdown.wait(0.08):
+            break
+    client.send_levels(1, 0.0, 0.0)
+
+
 class CaptureRuntime:
     """One session wav on disk. Capture writes; transcription runs after stop."""
 
@@ -721,6 +716,9 @@ class CaptureRuntime:
         self.session_id = ""
         self.recording = True
         self._channels = 1
+        self.level_left = 0.0
+        self.level_right = 0.0
+        self._level_at = 0.0
         self.stop_cb = None
 
     def snapshot(self) -> dict[str, object]:
@@ -738,6 +736,35 @@ class CaptureRuntime:
                 "phase": phase,
             }
 
+    def levels(self) -> dict[str, float]:
+        with self.lock:
+            return {
+                "channels": self._channels,
+                "left": self.level_left,
+                "right": self.level_right,
+            }
+
+    def _observe_locked(self, frame: np.ndarray) -> None:
+        """Fast attack, slow release, so the meter falls like a recorder."""
+        arr = np.asarray(frame, dtype=np.float32)
+        if arr.size == 0:
+            return
+        if arr.ndim == 1:
+            peaks = [float(np.max(np.abs(arr)))]
+        else:
+            peaks = [float(np.max(np.abs(arr[:, i]))) for i in range(min(2, arr.shape[1]))]
+        now = time.monotonic()
+        dt = 0.03 if self._level_at <= 0 else max(0.0, now - self._level_at)
+        self._level_at = now
+        release = math.exp(-dt / 0.28) if dt else 1.0
+
+        def follow(prev: float, peak: float) -> float:
+            peak = max(0.0, min(1.0, peak))
+            return peak if peak >= prev else prev * release
+
+        self.level_left = follow(self.level_left, peaks[0] if peaks else 0.0)
+        self.level_right = follow(self.level_right, peaks[1] if len(peaks) > 1 else 0.0)
+
     def open_wav(
         self,
         session_id: str,
@@ -754,6 +781,9 @@ class CaptureRuntime:
                 self.writer = None
             self.session_id = session_id or "session"
             self._channels = 2 if channels >= 2 else 1
+            self.level_left = 0.0
+            self.level_right = 0.0
+            self._level_at = 0.0
             if path is None:
                 path = new_capture_path(self.session_id)
             self.wav_path = Path(path)
@@ -772,6 +802,7 @@ class CaptureRuntime:
             if self.writer is None:
                 return
             self.writer.write_audio(frame)
+            self._observe_locked(frame)
 
     def close_wav(self) -> None:
         with self.lock:
@@ -882,7 +913,7 @@ def prepare_pipeline(args: argparse.Namespace) -> PyannoteDiarizer:
 def run_live(args: argparse.Namespace, client: AppClient) -> None:
     source = "both" if args.mic else args.source
     if source == "speakers":
-        source = "both"
+        source = "system"
     if source == "mic":
         sys_index, device_name = pick_mic_device(args.mic_device)
         mic_index = None
@@ -908,11 +939,23 @@ def run_live(args: argparse.Namespace, client: AppClient) -> None:
 
     print(f"Will listen on {device_name!r} ({source}) → {args.app}")
     print(f"Whisper model: {args.model}")
-    print(
-        "Live capture writes a wav. Dual capture stays stereo until transcription: "
-        "left is you (mic), right is them (BlackHole). Transcription runs after you stop.",
-        flush=True,
-    )
+    if mic_spec is not None:
+        print(
+            "Headphones capture writes a stereo wav: left is you (Mac mic), "
+            "right is the meeting (BlackHole). Transcription runs after you stop.",
+            flush=True,
+        )
+    elif source == "mic":
+        print(
+            "Mic capture writes one channel: the Mac microphone. Transcription runs after you stop.",
+            flush=True,
+        )
+    else:
+        print(
+            "Speakers capture writes one channel: the meeting on BlackHole. "
+            "The microphone is not recorded. Transcription runs after you stop.",
+            flush=True,
+        )
 
     runtime = CaptureRuntime()
     session_id = args.session_id or os.environ.get("STENOPOD_SESSION_ID") or "session"
@@ -937,6 +980,12 @@ def run_live(args: argparse.Namespace, client: AppClient) -> None:
         daemon=True,
     )
     hb.start()
+    levels = threading.Thread(
+        target=level_loop,
+        args=(client, shutdown, runtime),
+        daemon=True,
+    )
+    levels.start()
 
     stopping = threading.Event()
 
@@ -1212,7 +1261,7 @@ def main() -> None:
         "--source",
         choices=("system", "mic", "both", "speakers"),
         default="system",
-        help="system = BlackHole only, mic = microphone, both/speakers = BlackHole + mic",
+        help="system/speakers = BlackHole only (meeting). both = stereo, left Mac mic, right BlackHole",
     )
     parser.add_argument("--mic-device", help="Microphone name or index (default: built-in mic)")
     parser.add_argument("--mic", action="store_true", help="Shortcut for --source both")

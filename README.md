@@ -5,9 +5,9 @@ StenoPod captures whatever is playing on your Mac, transcribes it locally with *
 There is no hook into Zoom, Teams, or the browser. The sidecar listens to a virtual audio device (and optionally a file). English and German are both handled by multilingual Whisper; notes follow the dominant language of the speech.
 
 ```
-Mac speakers / headphones ─┐
-Apps  →  Multi-Output  ────┼─► BlackHole 2ch ─► sidecar (mlx-whisper, Metal)
-Mic  ──────────────────────┘                         │
+Speakers:   Meet → StenoPod Speakers → BlackHole ──────────────► one channel (meeting)
+Headphones: Meet → StenoPod Headphones → BlackHole ── right ──► stereo wav
+            MacBook mic ───────────────────────────── left  ──► sidecar
                                                      ▼ JSON segments
                                             FastAPI UI :8780
                                                      │
@@ -53,7 +53,7 @@ Make **two** Multi-Outputs and switch between them. Do not put speakers and head
 
 That two-device layout is correct: you only switch where **you** hear audio; BlackHole is ticked on both, so the sidecar should always get a copy. The sidecar still records **BlackHole**, not the Multi-Output name. If you hear Meet in the buds but BlackHole levels stay ~0, the Multi-Output is not actually copying (common with AirPods). Restart Chrome/Meet after switching Output, confirm 48 kHz and Drift Correction on BlackHole, and that BlackHole is not muted in Audio MIDI Setup when `StenoPod Headphones` is selected.
 
-`make sidecar` records **only BlackHole** (YouTube, Meet remote audio). It does **not** record your headphone mic. Your voice needs `make sidecar-meet`.
+`make sidecar` records **only BlackHole**, one channel (YouTube, or a meeting you are not speaking in). Your voice needs `make sidecar-meet`, which writes a stereo file: left is the Mac mic, right is BlackHole.
 
 **AirPods cannot be the listen device and the talk device at the same time.** If Input is AirPods, macOS switches them to Hands-Free: the Multi-Output copy into BlackHole goes silent, which is why the sidecar hears nothing. Keep Input on the MacBook mic.
 
@@ -73,7 +73,7 @@ make sidecar-meet MIC_DEVICE='MacBook Air-Mikrofon'
 ./.venv-host/bin/python host/sidecar.py --source both --mic-device "MacBook Air-Mikrofon"
 ```
 
-There is no `sidecar` binary. `make sidecar --source both` also does not work (Make eats the flags). `--source both` mixes BlackHole + mic into **one** stream, then pyannote splits speakers. It is not two labeled “Me” / “them” streams.
+There is no `sidecar` binary. `make sidecar --source both` also does not work (Make eats the flags). `--source both` keeps the two sides apart in one stereo file: **left** is the Mac microphone, **right** is BlackHole. Transcription reads each side on its own. `--source system` (and the Speakers choice in the UI) records BlackHole only.
 
 Prefer the **MacBook microphone** while you *listen* on Bluetooth. Do not set Sound → Input to AirPods.
 
@@ -81,7 +81,7 @@ If you select the headphone mic as the Mac’s input, macOS switches the headset
 
 There is no reliable way to use the AirPods mic with this stack. `make devices` may show `AirPods Pro - Find My`; that is not a microphone — ignore it.
 
-Use headphones so the Mac mic does not re-record the other side. pyannote splits you vs them as A/B — rename the chip after the first turns.
+Use headphones for the stereo recording so the Mac mic does not also hear the meeting. The left channel is you; the right channel is everyone else. Rename a speaker chip after the first turns if you want a name instead of a letter.
 
 If Meet/Webex has exclusive lock on the microphone, ffmpeg will fail to open it. Quit extra capture processes, or in Audio MIDI Setup create an **Aggregate Device** of BlackHole + your mic and run:
 
@@ -106,8 +106,8 @@ make up
 
 Open [http://127.0.0.1:8780](http://127.0.0.1:8780). Press **New meeting**, choose where you are listening, then **Start recording**.
 
-- **StenoPod Speakers** records system audio only. Set Sound → Output to `StenoPod Speakers`.
-- **StenoPod Headphones** records system audio plus the Mac microphone. Set Sound → Output to `StenoPod Headphones`, and Input to the Mac microphone.
+- **StenoPod Speakers · meeting only** records one channel: what is playing through the Mac speakers. Set Sound → Output to `StenoPod Speakers`. The microphone is not opened.
+- **StenoPod Headphones · you + meeting** records stereo. Left is the Mac microphone, right is what you hear in the headphones. Set Sound → Output to `StenoPod Headphones`, and Input to the Mac microphone.
 
 While recording, Transcribe stays off. **Stop recording** closes the wav under `.run/captures/` and starts transcription on its own: pyannote labels speakers on the whole recording, Whisper writes each turn with its language, then notes are written. Min and Max next to the source choose the speaker count (leave them blank for automatic, or set them equal for an exact count). Those values are saved with the meeting and used again by **Transcribe again**. The **Recordings** list opens any saved wav and can rerun speakers, transcript, and notes. **Download** saves the transcript or the notes. Rename a speaker to store that voice; a later meeting can reuse the name.
 
@@ -137,7 +137,7 @@ Stop the stack with `make down`. Logs: `make logs`.
 |---|---|---|
 | `host/sidecar.py --device` | BlackHole | AVFoundation name or index |
 | `host/sidecar.py --model` | `mlx-community/whisper-large-v3-turbo` | MLX Whisper repo |
-| `host/sidecar.py --source` | `system` | `system` (BlackHole), `mic`, or `both` (meetings) |
+| `host/sidecar.py --source` | `system` | `system` or `speakers` (BlackHole only), `mic`, or `both` (stereo: left mic, right BlackHole) |
 | `--mic-device` | built-in mic | Microphone name or index |
 | `HF_HUB_OFFLINE` | `1` | Inference uses the local cache only. `make models` is the online step. |
 | `LLM_MODEL` | `mlx-community/Qwen2.5-7B-Instruct-4bit` | Local MLX notes model |

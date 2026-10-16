@@ -109,9 +109,12 @@ function formatClock(s) {
 }
 
 const ROUTES = {
-  both: "Headphones: Output StenoPod Headphones, Input MacBook mic. Wav is stereo — left=you, right=them.",
-  speakers: "Speakers: Output StenoPod Speakers, Input MacBook mic. Wav is stereo — left=you, right=them. Echo from the speakers is cancelled on the left.",
-  system: "StenoPod Speakers · system audio only. Set Sound → Output to StenoPod Speakers.",
+  speakers:
+    "Speakers: Output StenoPod Speakers. One channel — the meeting only. The Mac mic is not recorded.",
+  system:
+    "Speakers: Output StenoPod Speakers. One channel — the meeting only. The Mac mic is not recorded.",
+  both:
+    "Headphones: Output StenoPod Headphones, Input MacBook mic. Stereo — left is you, right is the meeting.",
 };
 
 let lastState = null;
@@ -142,7 +145,7 @@ function ensureRecordTick(listening) {
     if (recordStartedAt == null) recordStartedAt = Date.now();
     if (!recordTick) {
       recordTick = setInterval(() => {
-        if (lastState) render(lastState);
+        if (lastState) render(lastState, { clock: true });
       }, 250);
     }
     return;
@@ -336,7 +339,7 @@ function renderJob(job) {
   }
 }
 
-function render(state) {
+function render(state, opts) {
   if (lastState && state.id !== lastState.id) {
     renamingId = null;
     renameDraft = "";
@@ -383,6 +386,11 @@ function render(state) {
   } else {
     $("device").textContent = route;
     setLamp("lamp-listen", "");
+  }
+  const meterChannels = state.sidecar && state.sidecar.source === "both" ? 2 : 1;
+  showMeter(listening, meterChannels);
+  if (!(opts && opts.clock) && listening && state.sidecar && state.sidecar.levels) {
+    paintMeter(state.sidecar.levels);
   }
   renderJob(busy ? job : null);
   renderRecordings(state.recordings, busy || listening);
@@ -462,11 +470,77 @@ async function fetchHealth() {
   }
 }
 
+const METER_SEGMENTS = 12;
+const METER_FLOOR_DB = -42;
+const meterHold = { you: 0, meet: 0, youAt: 0, meetAt: 0 };
+
+function peakToSegments(peak) {
+  const p = Math.max(0, Number(peak) || 0);
+  if (p < 1e-5) return 0;
+  const db = 20 * Math.log10(p);
+  const scaled = (db - METER_FLOOR_DB) / -METER_FLOOR_DB;
+  return Math.max(0, Math.min(METER_SEGMENTS, Math.round(scaled * METER_SEGMENTS)));
+}
+
+function buildMeters() {
+  for (const id of ["leds-you", "leds-meet"]) {
+    const el = $(id);
+    if (!el || el.childElementCount) continue;
+    for (let i = 0; i < METER_SEGMENTS; i += 1) {
+      el.appendChild(document.createElement("i"));
+    }
+  }
+}
+
+function setLeds(el, peak, key) {
+  if (!el) return;
+  const lit = peakToSegments(peak);
+  const now = Date.now();
+  if (lit >= meterHold[key]) {
+    meterHold[key] = lit;
+    meterHold[key + "At"] = now;
+  } else if (now - meterHold[key + "At"] > 700) {
+    meterHold[key] = lit;
+  }
+  const hold = meterHold[key];
+  const leds = el.children;
+  for (let i = 0; i < leds.length; i += 1) {
+    leds[i].classList.toggle("on", i < lit || i === hold - 1);
+  }
+  const pct = Math.round(Math.min(1, Math.max(0, Number(peak) || 0)) * 100);
+  el.setAttribute("aria-valuenow", String(pct));
+}
+
+function paintMeter(levels) {
+  const channels = Number(levels && levels.channels) || 1;
+  const you = $("meter-you");
+  if (you) you.hidden = channels < 2;
+  setLeds($("leds-you"), levels ? levels.left : 0, "you");
+  setLeds($("leds-meet"), levels ? (channels < 2 ? levels.left : levels.right) : 0, "meet");
+}
+
+function showMeter(listening, channels) {
+  const meter = $("meter");
+  if (!meter) return;
+  meter.hidden = !listening;
+  const you = $("meter-you");
+  if (you) you.hidden = !listening || channels < 2;
+  if (!listening) {
+    meterHold.you = 0;
+    meterHold.meet = 0;
+    paintMeter({ channels: 1, left: 0, right: 0 });
+  }
+}
+
 function connectWs() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/ws`);
   ws.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
+    if (msg.type === "levels" && msg.levels) {
+      paintMeter(msg.levels);
+      return;
+    }
     if (msg.state) render(msg.state);
   };
   ws.onclose = () => setTimeout(connectWs, 1500);
@@ -870,6 +944,7 @@ $("title").addEventListener("input", () => {
 });
 
 restoreSpeakerBounds();
+buildMeters();
 fetchState();
 fetchHealth();
 setInterval(fetchHealth, 8000);

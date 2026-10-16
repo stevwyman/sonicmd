@@ -19,7 +19,7 @@ help:
 	@echo "  make devices       List macOS audio capture devices"
 	@echo "  make capture-test  Record 3s from BlackHole, then 3s from the Mac mic (speak during the mic part)"
 	@echo "  make sidecar       Capture system audio (BlackHole) from the terminal"
-	@echo "  make sidecar-meet  Mix BlackHole + microphone (or use Start capture in the UI)"
+	@echo "  make sidecar-meet  Stereo: left Mac mic, right BlackHole (or use Start capture in the UI)"
 	@echo "  Extra sidecar flags: make sidecar-meet MIC_DEVICE='MacBook Air-Mikrofon'"
 
 models:

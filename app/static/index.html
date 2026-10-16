@@ -11,7 +11,7 @@
       rel="stylesheet"
       href="https://fonts.googleapis.com/css2?family=Red+Hat+Display:wght@500;700&family=Red+Hat+Mono:wght@400;500&family=Red+Hat+Text:wght@400;500&display=swap"
     />
-    <link rel="stylesheet" href="/static/styles.css?v=20260930a" />
+    <link rel="stylesheet" href="/static/styles.css?v=20261015c" />
   </head>
   <body>
     <header class="mast">
@@ -27,8 +27,8 @@
         </div>
         <div class="actions">
           <select id="capture-source" aria-label="What to record">
-            <option value="both" selected>StenoPod Headphones · them + you</option>
-            <option value="speakers">StenoPod Speakers · them + you</option>
+            <option value="speakers">StenoPod Speakers · meeting only</option>
+            <option value="both" selected>StenoPod Headphones · you + meeting</option>
           </select>
           <label class="spk-bounds">Min <input id="spk-min" type="number" inputmode="numeric" min="1" max="12" placeholder="auto" aria-label="Minimum speakers" /></label>
           <label class="spk-bounds">Max <input id="spk-max" type="number" inputmode="numeric" min="1" max="12" placeholder="auto" aria-label="Maximum speakers" /></label>
@@ -52,6 +52,16 @@
         <span id="counts"></span>
       </p>
       <p class="device" id="device"></p>
+      <div id="meter" class="meter" hidden>
+        <div class="meter-col" id="meter-you" hidden>
+          <span class="meter-name">You</span>
+          <div class="leds" id="leds-you" role="meter" aria-label="Your microphone" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
+        </div>
+        <div class="meter-col" id="meter-meet">
+          <span class="meter-name">Meeting</span>
+          <div class="leds" id="leds-meet" role="meter" aria-label="Meeting audio" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
+        </div>
+      </div>
       <div id="job" class="job" hidden>
         <p id="job-label" class="job-label"></p>
         <div id="job-bar" class="job-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
@@ -90,6 +100,6 @@
         </section>
       </main>
     </div>
-    <script src="/static/app.js?v=20260930a"></script>
+    <script src="/static/app.js?v=20261015b"></script>
   </body>
 </html>

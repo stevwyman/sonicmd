@@ -211,6 +211,40 @@ button.ghost:disabled:hover { background: transparent; border-color: #6a6e73; }
 }
 #counts { font-family: var(--mono); font-size: 12px; color: var(--rh-gray-600); }
 .device { margin: 0 0 10px; font-family: var(--mono); font-size: 12px; color: var(--rh-gray-600); min-height: 1em; }
+.meter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 22px;
+  align-items: center;
+  margin: 0 0 12px;
+}
+.meter[hidden] { display: none; }
+.meter-col { display: flex; flex-direction: row; align-items: center; gap: 8px; }
+.meter-col[hidden] { display: none; }
+.leds {
+  display: flex;
+  flex-direction: row;
+  gap: 2px;
+  padding: 4px 5px;
+  background: var(--rh-black);
+  border-radius: 3px;
+}
+.leds i {
+  width: 8px;
+  height: 14px;
+  background: #3c3f42;
+  display: block;
+}
+.leds i.on:nth-child(-n+8) { background: #5ba84f; }
+.leds i.on:nth-child(n+9):nth-child(-n+10) { background: #f0ab00; }
+.leds i.on:nth-child(n+11) { background: #ee0000; }
+.meter-name {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--rh-gray-600);
+}
 .job { margin: 0 0 18px; }
 .job-label { margin: 0 0 6px; font-family: var(--mono); font-size: 12px; color: var(--rh-gray-600); }
 .job-log {
